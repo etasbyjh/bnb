@@ -1,0 +1,22 @@
+
+docker ps            # running containers
+docker ps -a         # all containers (stopped + running)
+docker inspect -f '{{.State.Status}}' btc-bot
+
+docker stop btc-bot
+
+# stop & remove current container
+docker rm -f btc-bot
+
+# re-run with Google Cloud Logging driver
+docker run -d --name btc-bot --restart=always \
+  --log-driver=gcplogs --log-opt gcp-log-cmd=true \
+  btc-bot
+
+# verify
+docker ps
+docker logs -f btc-bot   # display log in SSH
+docker logs --tail 100 btc-bot    # display log in SSH
+
+# docker is running?
+sudo systemctl status docker --no-pager
