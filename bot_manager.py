@@ -2,9 +2,7 @@
 # Python 3.10+
 # - WebSocket price feed(s)
 # - Paper-trading bot(s)
-# - Central FundManager shared by bots
-# - Global one-minute report (configurable via REPORT_EVERY)
-# - Admin HTTP API to add/remove/respawn bots at runtime
+# - Central FundManager with global one-minute report (REPORT_EVERY)
 # - Clear params; graceful cancel (close orders + return funds)
 # - Optional lifetime per bot + optional auto-respawn
 
@@ -23,7 +21,6 @@ from typing import Any, Dict, Optional, Callable, List, Tuple
 from datetime import datetime, timezone
 
 from aiohttp import web
-import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -123,7 +120,7 @@ class BaseBot:
         self._stop = asyncio.Event()
         self._started_ts: Optional[float] = None
         # Optional lifetime in seconds (0/None = no expiry)
-        life = cfg.params.get("bot_lifetime_sec", 0) or 0
+        life = cfg.params.get("bot_lifetime_seconds", 0) or 0
         self.lifetime_sec: Optional[int] = int(life) if life else None
 
     async def on_start(self) -> None: ...
@@ -151,7 +148,7 @@ class BaseBot:
             while not self._stop.is_set():
                 # expiry check
                 if self.lifetime_sec and self.active_duration() >= self.lifetime_sec:
-                    self.log.info("lifetime reached (%ss), stopping", self.lifetime_sec)
+                    self.log.info(f"lifetime reached ({self.lifetime_sec}s), stopping")
                     break
                 await self.on_tick()
                 try:
@@ -224,7 +221,7 @@ class WSPriceBot(BaseBot):
         while not self._stopping:
             url = self._ws_url()
             try:
-                self.log.info("connecting %s", url)
+                self.log.info(f"connecting {url}")
                 async with websockets.connect(url, ping_interval=15, ping_timeout=20) as ws:
                     self.log.info("connected")
                     backoff = 1.0
@@ -239,14 +236,14 @@ class WSPriceBot(BaseBot):
                                 price = Decimal(data["p"])
                                 await self.bus.set_price(symbol, price)
                         except Exception as parse_err:
-                            self.log.debug("parse error: %s", parse_err)
+                            self.log.debug(f"parse error: {parse_err}")
             except (ConnectionClosed, OSError) as net_err:
-                self.log.warning("ws closed: %s", net_err)
+                self.log.warning(f"ws closed: {net_err}")
             if self._stopping:
                 break
             jitter = 1 + random.uniform(-self.cfg.jitter, self.cfg.jitter)
             delay = min(backoff * jitter, self.cfg.max_backoff)
-            self.log.info("reconnecting in %.1fs", delay)
+            self.log.info(f"reconnecting in {delay:.1f}s")
             await asyncio.sleep(delay)
             backoff = min(backoff * 2, self.cfg.max_backoff)
 
@@ -359,10 +356,10 @@ class PaperBroker:
 # ----------------------- Paper trading bot ----------------------
 class PaperTradingBot(BaseBot):
     """
-    Paper bot that:
+    Paper bot:
       - Keeps one BUY at spot*(1 - buy_gap) if funds allow
       - Keeps one SELL at last_buy*(1 + sell_gap), floor = last_buy*(1 + min_profit)
-      - TTL cancels & reprices after N seconds
+      - TTL cancels & reprices after order_expiry_seconds
       - Publishes snapshots to ReportHub (global reporter prints them)
       - On stop: cancel all, return funds to FundManager
     """
@@ -384,7 +381,7 @@ class PaperTradingBot(BaseBot):
         self.buy_gap = Decimal(str(p["gaps"]["buy_gap_pct"])) / Decimal("100")
         self.sell_gap = Decimal(str(p["gaps"]["sell_gap_pct"])) / Decimal("100")
         self.min_profit = Decimal(str(p.get("min_profit_pct", p["gaps"]["sell_gap_pct"]))) / Decimal("100")
-        self.order_ttl = int(p.get("order_ttl_sec", 0))  # 0 = no TTL
+        self.order_ttl = int(p.get("order_expiry_seconds", 0))  # 0 = no TTL
 
         self.account_quote = self._quote_for_symbol(self.symbol)
         self._allocated_quote = d(p["balances"]["quote"])
@@ -417,7 +414,7 @@ class PaperTradingBot(BaseBot):
             pass
         # cancel all and return funds
         n = self.broker.cancel_all()
-        self.log.info("canceled %s open orders", n)
+        self.log.info(f"canceled {n} open orders")
         base_bal, quote_bal = self.broker.sweep_balances()
         base_sym = self._base_for_symbol(self.symbol)
         if base_bal > 0:
@@ -457,7 +454,7 @@ class PaperTradingBot(BaseBot):
         _ = self.broker.cancel_side("BUY")
 
         if not self._can_place_buy():
-            self.log.info("Skip BUY reprice (%s): insufficient quote", reason)
+            self.log.info(f"Skip BUY reprice ({reason}): insufficient quote")
             return
 
         target_buy = spot * (Decimal("1") - self.buy_gap)
@@ -467,17 +464,15 @@ class PaperTradingBot(BaseBot):
         try:
             o = self.broker.place_limit("BUY", target_buy, qty)
         except ValueError as e:
-            self.log.info("Skip BUY reprice (%s): rounded qty=%s price=%s -> %s", reason, qty, target_buy, e)
+            self.log.info(f"Skip BUY reprice ({reason}): rounded qty={qty} price={target_buy} -> {e}")
             return
 
         self._track_placement(o, "BUY")
         # stage = number of BUY (re)placements
-        reason_map = {"buy_fill": "buy_fill", "sell_fill": "sell_fill", "ttl": "ttl", "ensure": "ensure"}
         self.stage = getattr(self, "stage", 0) + 1
         self.retriggers = getattr(self, "retriggers", {"buy_fill": 0, "sell_fill": 0, "ttl": 0, "ensure": 0})
-        self.retriggers[reason_map.get(reason, "ensure")] = self.retriggers.get(reason, 0) + 1
-        self.log.info("BUY (re)placed #%s @%s qty=%s [reason=%s stage=%s]",
-                      o.orderId, o.price, o.qty, reason, self.stage)
+        self.retriggers[reason] = self.retriggers.get(reason, 0) + 1
+        self.log.info(f"BUY (re)placed #{o.orderId} @{o.price} qty={o.qty} [reason={reason} stage={self.stage}]")
 
     async def _publish_snapshot(self, price: Optional[Decimal]) -> None:
         p_dp  = self._dp(self.broker.tick)
@@ -559,9 +554,9 @@ class PaperTradingBot(BaseBot):
                 o = self.broker.place_limit("SELL", target_sell, qty)
                 self._track_placement(o, "SELL")
                 self.last_sell_price = o.price
-                self.log.info("SELL placed #%s @%s qty=%s", o.orderId, target_sell, qty)
+                self.log.info(f"SELL placed #{o.orderId} @{target_sell} qty={qty}")
             except ValueError as e:
-                self.log.info("Skip SELL: %s", e)
+                self.log.info(f"Skip SELL: {e}")
 
         # TTL cancellation & flag
         canceled_buy_ttl = False
@@ -574,7 +569,7 @@ class PaperTradingBot(BaseBot):
                     self._placed_at.pop(o.orderId, None)
                     if o.side == "BUY":
                         canceled_buy_ttl = True
-                    self.log.info("%s #%s canceled (TTL %ss)", o.side, o.orderId, self.order_ttl)
+                    self.log.info(f"{o.side} #{o.orderId} canceled (TTL {self.order_ttl}s)")
 
         # reprice reason
         reprice_reason = None
@@ -595,9 +590,7 @@ class PaperTradingBot(BaseBot):
 
 # -------------------------- supervisor + manager -----------------
 class BotSupervisor:
-    """
-    Wraps a bot, adds start/stop.
-    """
+    """Wraps a bot, adds start/stop."""
     def __init__(self, factory: Callable[[BotConfig], BaseBot], cfg: BotConfig):
         self.factory = factory
         self.cfg = cfg
@@ -699,12 +692,14 @@ class AdminHTTP:
       buy_gap_pct: float (e.g., 0.2)
       sell_gap_pct: float
       min_profit_pct: float
-      order_ttl_sec: int (time-to-live for unfilled orders; 0 = never auto-cancel)
+      order_expiry_seconds: int (TTL for unfilled orders; 0 = never auto-cancel)
       fee_rate: float (e.g., 0.0001)
-      init_base: decimal string/number (requested base asset amount, e.g., "0")
-      init_quote: decimal string/number (requested quote amount, e.g., 2000)
-      bot_lifetime_sec: int (0 = no expiry)
-      respawn_wait_sec: int (optional; auto-respawn with same params after cancel/expiry)
+      starting_base_qty: decimal string/number (requested base asset qty, e.g., "0")
+      starting_quote_qty: decimal string/number (requested quote amount, e.g., 2000)
+      bot_lifetime_seconds: int (0 = no expiry)
+      respawn_delay_seconds: int (optional; auto-respawn after cancel/expiry)
+
+    Backward-compat (optional): order_ttl_seconds, base, quote, expiry_sec, respawn_after_sec
     """
     def __init__(self, mgr: BotManager, bus: PriceBus, funds: FundManager, hub: ReportHub):
         self.mgr = mgr
@@ -750,16 +745,16 @@ class AdminHTTP:
         venue = str(payload.get("venue","us")).lower()
         use_us = (venue == "us")
 
-        # renamed (with backwards-compat fallbacks)
+        # renamed (with backward-compat fallbacks)
         buy_gap = Decimal(str(payload.get("buy_gap_pct", 0.2)))
         sell_gap = Decimal(str(payload.get("sell_gap_pct", 0.2)))
         min_profit = Decimal(str(payload.get("min_profit_pct", payload.get("sell_gap_pct", 0.2))))
-        order_ttl_sec = int(payload.get("order_ttl_sec", payload.get("order_ttl_seconds", 0)))
+        order_expiry_seconds = int(payload.get("order_expiry_seconds", payload.get("order_ttl_seconds", 0)))
         fee = Decimal(str(payload.get("fee_rate", 0.0001)))
-        init_base = Decimal(str(payload.get("init_base", payload.get("base", 0))))
-        init_quote = Decimal(str(payload.get("init_quote", payload.get("quote", 2000))))
-        bot_lifetime_sec = int(payload.get("bot_lifetime_sec", payload.get("expiry_sec", 0)))
-        respawn_wait_sec = int(payload.get("respawn_wait_sec", payload.get("respawn_after_sec", 0)))
+        starting_base_qty = Decimal(str(payload.get("starting_base_qty", payload.get("base", 0))))
+        starting_quote_qty = Decimal(str(payload.get("starting_quote_qty", payload.get("quote", 2000))))
+        bot_lifetime_seconds = int(payload.get("bot_lifetime_seconds", payload.get("expiry_sec", 0)))
+        respawn_delay_seconds = int(payload.get("respawn_delay_seconds", payload.get("respawn_after_sec", 0)))
 
         filters = payload.get("filters", self.filters_default)
 
@@ -786,18 +781,18 @@ class AdminHTTP:
                 "filters": filters,
                 "gaps": {"buy_gap_pct": float(buy_gap), "sell_gap_pct": float(sell_gap)},
                 "min_profit_pct": float(min_profit),
-                "balances": {"base": str(init_base), "quote": str(init_quote)},
+                "balances": {"base": str(starting_base_qty), "quote": str(starting_quote_qty)},
                 "fee_rate": float(fee),
-                "order_ttl_sec": order_ttl_sec,
-                "bot_lifetime_sec": bot_lifetime_sec,
+                "order_expiry_seconds": order_expiry_seconds,
+                "bot_lifetime_seconds": bot_lifetime_seconds,
             },
         )
         await self.mgr.add_and_start(paper_name, lambda c: PaperTradingBot(c), paper_cfg)
-        self.log.info("added %s (+ %s if new)", paper_name, ws_name)
+        self.log.info(f"added {paper_name} (+ {ws_name} if new)")
 
-        # remember respawn preference in meta (stored in cfg.params)
-        if respawn_wait_sec:
-            self.mgr._meta[paper_name][1].params["respawn_wait_sec"] = respawn_wait_sec
+        # remember respawn preference in meta (stored in cfg.params) for expiry-based respawn
+        if respawn_delay_seconds:
+            self.mgr._meta[paper_name][1].params["respawn_delay_seconds"] = respawn_delay_seconds
 
         return web.json_response({"ok": True, "added": [paper_name], "ws": ws_name})
 
@@ -812,7 +807,7 @@ class AdminHTTP:
         if not ok:
             return web.json_response({"removed": False, "name": name}, status=404)
 
-        # explicit manual respawn timer
+        # explicit manual respawn timer via query
         if respawn_after and meta:
             factory, old_cfg = meta
             new_cfg = BotConfig(
@@ -825,7 +820,7 @@ class AdminHTTP:
             async def _respawn():
                 await asyncio.sleep(respawn_after)
                 await self.mgr.add_and_start(new_cfg.name, factory, new_cfg)
-                self.log.info("respawned %s after %ss", new_cfg.name, respawn_after)
+                self.log.info(f"respawned {new_cfg.name} after {respawn_after}s")
             asyncio.create_task(_respawn())
 
         return web.json_response({"removed": True, "name": name, "respawn_scheduled": bool(respawn_after)})
@@ -846,7 +841,6 @@ class AdminHTTP:
                 else:
                     lines.append("  (none)")
 
-                # Compute global PnL summary across bots if present (sum quoted in quote currency per bot)
                 for name, s in sorted(snaps.items()):
                     lines.append(f"{name}: Stage {s.get('stage',0)}, "
                                  f"Current Fund {s.get('quote_bal','0')} {s.get('quote_sym','')}, "
@@ -864,12 +858,12 @@ class AdminHTTP:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logging.getLogger("report").warning("reporter error: %s", e)
+                logging.getLogger("report").warning(f"reporter error: {e}")
 
     async def _watch_expired_and_respawn(self):
         """
         Every 5s, look for paper-* bots that are no longer running but have
-        respawn_wait_sec set in their saved params; respawn them once.
+        respawn_delay_seconds set in their saved params; respawn them once.
         """
         while True:
             try:
@@ -880,19 +874,19 @@ class AdminHTTP:
                         continue
                     if name in running:
                         continue
-                    ra = int(cfg.params.get("respawn_wait_sec", 0)) or 0
+                    ra = int(cfg.params.get("respawn_delay_seconds", 0)) or 0
                     if ra > 0:
                         # consume the flag to avoid repeated respawns
-                        cfg.params["respawn_wait_sec"] = 0
+                        cfg.params["respawn_delay_seconds"] = 0
                         async def _do():
                             await asyncio.sleep(ra)
                             await self.mgr.add_and_start(cfg.name, factory, cfg)
-                            self.log.info("auto-respawned %s after %ss", cfg.name, ra)
+                            self.log.info(f"auto-respawned {cfg.name} after {ra}s")
                         asyncio.create_task(_do())
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logging.getLogger("respawn").warning("watch error: %s", e)
+                logging.getLogger("respawn").warning(f"watch error: {e}")
 
     async def start(self, host="127.0.0.1", port=8080):
         self._runner = web.AppRunner(self.app)
@@ -901,7 +895,7 @@ class AdminHTTP:
         await self._site.start()
         self._report_task = asyncio.create_task(self._global_reporter())
         self._watch_task = asyncio.create_task(self._watch_expired_and_respawn())
-        self.log.info("admin API listening on http://%s:%s", host=host, port=port)
+        self.log.info(f"admin API listening on http://{host}:{port}")
 
     async def stop(self):
         for t in ("_report_task", "_watch_task"):
@@ -962,8 +956,8 @@ async def main() -> None:
                 "min_profit_pct": 0.1,
                 "balances": {"base":"0", "quote":"2000"},
                 "fee_rate": 0.0001,
-                "order_ttl_sec": 28800,
-                "bot_lifetime_sec": 0,
+                "order_expiry_seconds": 28800,
+                "bot_lifetime_seconds": 0,
             },
         )
         await mgr.add_and_start(ws.name, lambda c: WSPriceBot(c), ws)
