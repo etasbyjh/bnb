@@ -1,10 +1,9 @@
 # bot_manager.py
 # Python 3.10+
-# WS price feed + paper-trading bot under an async manager.
-# Report every minute:
-#   - stage + retrigger breakdown
-#   - price, USD balance, BTC balance, PnL
-#   - one line per order: side, target price, amount, state (placed/filled/canceled)
+# - WebSocket price feed(s)
+# - Paper-trading bot(s)
+# - Admin HTTP API to add/remove bots at runtime
+# - Minute reports (price, balances, PnL, orders) + stage/retrigger counters
 
 from __future__ import annotations
 
@@ -13,10 +12,13 @@ import json
 import logging
 import random
 import signal
+import argparse
+import os
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Callable, List, Tuple
 
+from aiohttp import web
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -142,8 +144,8 @@ class WSPriceBot(BaseBot):
                                 symbol = (data.get("s") or msg.get("stream", "").split("@")[0]).upper()
                                 price = Decimal(data["p"])
                                 await self.bus.set_price(symbol, price)
-                                # Optional heartbeat to verify feed:
-                                # self.log.info("tick %s %s", symbol, price)
+                                # Optional heartbeat:
+                                # self.log.debug("tick %s %s", symbol, price)
                         except Exception as parse_err:
                             self.log.debug("parse error: %s", parse_err)
             except (ConnectionClosed, OSError) as net_err:
@@ -284,10 +286,7 @@ class PaperTradingBot(BaseBot):
         self._handled_fills: set[int] = set()
 
         # Reporting / PnL
-        try:
-            self._report_t0 = asyncio.get_running_loop().time()
-        except RuntimeError:
-            self._report_t0 = 0.0
+        self._report_t0 = 0.0
         self._initial_equity: Optional[Decimal] = None
         self._last_price: Optional[Decimal] = None
 
@@ -297,6 +296,12 @@ class PaperTradingBot(BaseBot):
 
         # derive base/quote symbols for display
         self.base_sym, self.quote_sym = self._split_symbol(self.symbol)
+
+        # optional heartbeat
+        self._last_heartbeat = 0.0
+
+    async def on_start(self) -> None:
+        self._report_t0 = asyncio.get_running_loop().time()
 
     # ----------- helpers -----------
     def _split_symbol(self, sym: str) -> Tuple[str, str]:
@@ -322,31 +327,27 @@ class PaperTradingBot(BaseBot):
         """Cancel any open BUY and place a fresh BUY at spot * (1 - buy_gap).
            Only increments stage/counters if a new BUY is actually placed."""
         _ = self.broker.cancel_side("BUY")
-    
+
         if not self._can_place_buy():
             self.log.info("Skip BUY reprice (%s): insufficient quote", reason)
             return
-    
+
         target_buy = spot * (Decimal("1") - self.buy_gap)
         budget = self.broker.quote_bal
         qty = self.broker._round_down(budget / target_buy, self.broker.step)
-    
+
         try:
             o = self.broker.place_limit("BUY", target_buy, qty)
         except ValueError as e:
-            # e.g., below min_notional/min_qty after rounding
-            self.log.info("Skip BUY reprice (%s): %s", reason, e)
+            self.log.info("Skip BUY reprice (%s): rounded qty=%s price=%s -> %s", reason, qty, target_buy, e)
             return
-    
+
         # success → track + bump stage & reason count
         self._track_placement(o, "BUY")
         self.stage += 1
         self.retriggers[reason] = self.retriggers.get(reason, 0) + 1
-        self.log.info(
-            "BUY (re)placed #%s @%s qty=%s [reason=%s stage=%s]",
-            o.orderId, o.price, o.qty, reason, self.stage
-        )
-
+        self.log.info("BUY (re)placed #%s @%s qty=%s [reason=%s stage=%s]",
+                      o.orderId, o.price, o.qty, reason, self.stage)
 
     def _maybe_init_equity(self, price: Decimal) -> None:
         if self._initial_equity is None:
@@ -358,13 +359,18 @@ class PaperTradingBot(BaseBot):
         if self._report_t0 == 0.0:
             self._report_t0 = now
 
+        # heartbeat every 5 min
+        if now - self._last_heartbeat >= 300:
+            self.log.info("alive | stage=%s open_buy=%d open_sell=%d",
+                          self.stage, len(self.broker.open_by_side("BUY")), len(self.broker.open_by_side("SELL")))
+            self._last_heartbeat = now
+
         if now - self._report_t0 >= self.report_every:
             p_dp  = self._dp(self.broker.tick)
             q_dp  = self._dp(self.broker.step)
 
             if price is None:
                 price_str = "n/a"
-                equity = self.broker.quote_bal
                 pnl_str = "n/a"
                 pnl_pct_str = "n/a"
             else:
@@ -377,7 +383,6 @@ class PaperTradingBot(BaseBot):
                 pnl_str = self._fmt(pnl, 2)
                 pnl_pct_str = self._fmt(pnl_pct, 4) + "%"
 
-            # stage / retrigger summary
             r = self.retriggers
             stage_str = f"stage={self.stage} (buy_fill={r.get('buy_fill',0)}, sell_fill={r.get('sell_fill',0)}, ttl={r.get('ttl',0)}, ensure={r.get('ensure',0)})"
 
@@ -406,7 +411,6 @@ class PaperTradingBot(BaseBot):
             try:
                 price = await self.bus.wait_for_price(self.symbol, timeout=5)
             except TimeoutError:
-                # still report on schedule even without price
                 self._report_if_due(None)
                 return
 
@@ -442,30 +446,32 @@ class PaperTradingBot(BaseBot):
             except ValueError as e:
                 self.log.info("Skip SELL: %s", e)
 
-        # Event-driven BUY reprices (counted as retriggers)
-        if buy_filled:
-            self._reprice_buy_from_spot(price, reason="buy_fill")
-        if sell_filled:
-            self._reprice_buy_from_spot(price, reason="sell_fill")
-
-        # TTL: cancel any open orders older than N seconds (if BUY canceled, reprice immediately with reason=ttl)
+        # TTL cancellation & flag
+        canceled_buy_ttl = False
         if self.order_ttl > 0:
             now = asyncio.get_running_loop().time()
-            canceled_buy = 0
             for o in [*self.broker.open_by_side("BUY"), *self.broker.open_by_side("SELL")]:
                 placed = self._placed_at.get(o.orderId)
                 if placed and (now - placed) >= self.order_ttl:
                     o.status = "CANCELED"
                     self._placed_at.pop(o.orderId, None)
                     if o.side == "BUY":
-                        canceled_buy += 1
+                        canceled_buy_ttl = True
                     self.log.info("%s #%s canceled (TTL %ss)", o.side, o.orderId, self.order_ttl)
-            if canceled_buy > 0:
-                self._reprice_buy_from_spot(price, reason="ttl")
 
-        # Ensure at least one BUY exists (counted under 'ensure' if we had to place one)
-        if not self.broker.open_by_side("BUY"):
-            self._reprice_buy_from_spot(price, reason="ensure")
+        # Collapse reprice reasons to at most one per tick
+        reprice_reason = None
+        if buy_filled:
+            reprice_reason = "buy_fill"
+        elif sell_filled:
+            reprice_reason = "sell_fill"
+        elif canceled_buy_ttl:
+            reprice_reason = "ttl"
+        elif not self.broker.open_by_side("BUY"):
+            reprice_reason = "ensure"
+
+        if reprice_reason:
+            self._reprice_buy_from_spot(price, reason=reprice_reason)
 
         # Minute report (works even if price briefly missing)
         self._report_if_due(self._last_price)
@@ -516,13 +522,36 @@ class BotManager:
     def __init__(self):
         self.log = logging.getLogger("manager")
         self._supers: Dict[str, BotSupervisor] = {}
+        self._started = False
+        self._lock = asyncio.Lock()
 
     def add(self, name: str, factory: Callable[[BotConfig], BaseBot], cfg: BotConfig) -> None:
         if name in self._supers:
             raise ValueError(f"bot '{name}' exists")
         self._supers[name] = BotSupervisor(factory, cfg)
 
+    async def add_and_start(self, name: str, factory: Callable[[BotConfig], BaseBot], cfg: BotConfig) -> None:
+        async with self._lock:
+            if name in self._supers:
+                raise ValueError(f"bot '{name}' exists")
+            sup = BotSupervisor(factory, cfg)
+            self._supers[name] = sup
+            if self._started:
+                await sup.start()
+
+    async def remove_and_stop(self, name: str) -> bool:
+        async with self._lock:
+            sup = self._supers.pop(name, None)
+        if not sup:
+            return False
+        await sup.stop()
+        return True
+
+    def list_names(self) -> List[str]:
+        return sorted(self._supers.keys())
+
     async def start(self) -> None:
+        self._started = True
         for sup in self._supers.values():
             await sup.start()
 
@@ -547,43 +576,160 @@ class BotManager:
         await stop_ev.wait()
         await self.stop()
 
-# --------------------------- bootstrap ---------------------------
+# --------------------------- admin HTTP --------------------------
+class AdminHTTP:
+    """
+    Super-light admin API:
+      GET  /bots                -> list bots
+      POST /bots                -> add {symbol, venue, buy_gap_pct, ...}
+      DELETE /bots/{name}       -> remove a bot by name
+    If ADMIN_TOKEN env var is set, require header: X-Admin-Token: <token>
+    """
+    def __init__(self, mgr: BotManager, bus: PriceBus):
+        self.mgr = mgr
+        self.bus = bus
+        self.log = logging.getLogger("admin")
+        self.token = os.getenv("ADMIN_TOKEN")  # optional
+        self.filters_default = {"tick":"0.01","step":"0.000001","min_qty":"0.00001","min_notional":"10.0"}
+
+        self.app = web.Application(middlewares=[self._auth_mw])
+        self.app.add_routes([
+            web.get("/bots", self.get_bots),
+            web.post("/bots", self.post_bot),
+            web.delete("/bots/{name}", self.del_bot),
+        ])
+        self._runner: Optional[web.AppRunner] = None
+        self._site: Optional[web.TCPSite] = None
+
+    @web.middleware
+    async def _auth_mw(self, request, handler):
+        if self.token and request.headers.get("x-admin-token") != self.token:
+            return web.json_response({"error":"unauthorized"}, status=401)
+        return await handler(request)
+
+    async def get_bots(self, request):
+        return web.json_response({"bots": self.mgr.list_names()})
+
+    async def post_bot(self, request):
+        payload = await request.json()
+        sym = str(payload.get("symbol","")).upper()
+        if not sym:
+            return web.json_response({"error":"symbol required"}, status=400)
+
+        venue = str(payload.get("venue","us")).lower()
+        use_us = (venue == "us")
+
+        buy_gap = Decimal(str(payload.get("buy_gap_pct", 0.2)))
+        sell_gap = Decimal(str(payload.get("sell_gap_pct", 0.2)))
+        min_profit = Decimal(str(payload.get("min_profit_pct", payload.get("sell_gap_pct", 0.2))))
+        ttl = int(payload.get("order_ttl_seconds", 28800))
+        report = int(payload.get("report_interval_sec", 60))
+        fee = Decimal(str(payload.get("fee_rate", 0.0001)))
+        base = Decimal(str(payload.get("base", 0)))
+        quote = Decimal(str(payload.get("quote", 2000)))
+        filters = payload.get("filters", self.filters_default)
+
+        # create a dedicated WS for this symbol if not present
+        ws_name = f"ws-{sym.lower()}"
+        if ws_name not in self.mgr._supers:
+            ws_cfg = BotConfig(
+                name=ws_name, tick_seconds=0.1,
+                params={"bus": self.bus, "use_us": use_us, "symbols": [sym]},
+            )
+            await self.mgr.add_and_start(ws_name, lambda c: WSPriceBot(c), ws_cfg)
+
+        paper_name = f"paper-{sym.lower()}"
+        if paper_name in self.mgr._supers:
+            return web.json_response({"error":f"bot {paper_name} exists"}, status=409)
+
+        paper_cfg = BotConfig(
+            name=paper_name, tick_seconds=1.0,
+            params={
+                "bus": self.bus,
+                "symbol": sym,
+                "filters": filters,
+                "gaps": {"buy_gap_pct": float(buy_gap), "sell_gap_pct": float(sell_gap)},
+                "min_profit_pct": float(min_profit),
+                "balances": {"base": str(base), "quote": str(quote)},
+                "fee_rate": float(fee),
+                "order_ttl_seconds": ttl,
+                "report_interval_sec": report,
+            },
+        )
+        await self.mgr.add_and_start(paper_name, lambda c: PaperTradingBot(c), paper_cfg)
+        self.log.info("added %s (+ %s if new)", paper_name, ws_name)
+        return web.json_response({"ok": True, "added": [paper_name], "ws": ws_name})
+
+    async def del_bot(self, request):
+        name = request.match_info["name"]
+        ok = await self.mgr.remove_and_stop(name)
+        return web.json_response({"removed": ok, "name": name}, status=200 if ok else 404)
+
+    async def start(self, host="127.0.0.1", port=8080):
+        self._runner = web.AppRunner(self.app)
+        await self._runner.setup()
+        self._site = web.TCPSite(self._runner, host=host, port=port)
+        await self._site.start()
+        self.log.info("admin API listening on http://%s:%s", host, port)
+
+    async def stop(self):
+        if self._site:
+            await self._site.stop()
+        if self._runner:
+            await self._runner.cleanup()
+
+# --------------------------- CLI & bootstrap ---------------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Paper bots with admin API")
+    ap.add_argument("--admin-host", default=os.getenv("ADMIN_HOST","127.0.0.1"))
+    ap.add_argument("--admin-port", type=int, default=int(os.getenv("ADMIN_PORT","8080")))
+    ap.add_argument("--venue", choices=["us","com"], default="us", help="Binance venue")
+    ap.add_argument("--paper", action="append", default=[], help="Start these symbols at boot (repeatable)")
+    return ap.parse_args()
+
 async def main() -> None:
     setup_logging()
+    args = parse_args()
+
     bus = PriceBus()
-
-    # WS feed (Binance.US). For Binance.com: use_us=False and symbols=["BTCUSDT"].
-    ws_cfg = BotConfig(
-        name="ws-feed",
-        tick_seconds=0.1,
-        params={"bus": bus, "use_us": True, "symbols": ["BTCUSD"]},
-    )
-
-    # Paper trader config (e.g., 0.2% gaps, 8h TTL, 1-min reporting)
-    paper_cfg = BotConfig(
-        name="paper-btc",
-        tick_seconds=1.0,
-        params={
-            "bus": bus,
-            "symbol": "BTCUSD",
-            "filters": {"tick": "0.01", "step": "0.000001", "min_qty": "0.00001", "min_notional": "10.0"},
-            "gaps": {"buy_gap_pct": 0.2, "sell_gap_pct": 0.2},
-            "min_profit_pct": 0.1,
-            "balances": {"base": "0", "quote": "2000"},
-            "fee_rate": 0.0001,
-            "order_ttl_seconds": 28800,   # 8 hours
-            "report_interval_sec": 60,    # 1 minute
-        },
-    )
-
     mgr = BotManager()
-    mgr.add("ws-feed", lambda cfg: WSPriceBot(cfg), ws_cfg)
-    mgr.add("paper-btc", lambda cfg: PaperTradingBot(cfg), paper_cfg)
 
-    await mgr.run()
+    # Optionally start initial symbols (each gets its own WS + paper bot)
+    for sym in [s.upper() for s in args.paper]:
+        ws = BotConfig(
+            name=f"ws-{sym.lower()}",
+            tick_seconds=0.1,
+            params={"bus": bus, "use_us": (args.venue=='us'), "symbols":[sym]},
+        )
+        paper = BotConfig(
+            name=f"paper-{sym.lower()}",
+            tick_seconds=1.0,
+            params={
+                "bus": bus,
+                "symbol": sym,
+                "filters": {"tick":"0.01","step":"0.000001","min_qty":"0.00001","min_notional":"10.0"},
+                "gaps": {"buy_gap_pct": 0.2, "sell_gap_pct": 0.2},
+                "min_profit_pct": 0.1,
+                "balances": {"base":"0", "quote":"2000"},
+                "fee_rate": 0.0001,
+                "order_ttl_seconds": 28800,
+                "report_interval_sec": 60,
+            },
+        )
+        await mgr.add_and_start(ws.name, lambda c: WSPriceBot(c), ws)
+        await mgr.add_and_start(paper.name, lambda c: PaperTradingBot(c), paper)
+
+    # Start admin API
+    admin = AdminHTTP(mgr, bus)
+    await admin.start(host=args.admin_host, port=args.admin_port)
+
+    try:
+        await mgr.run()  # until signal
+    finally:
+        await admin.stop()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(main()) 
     except KeyboardInterrupt:
         pass
