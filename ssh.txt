@@ -25,6 +25,8 @@ docker build --pull --no-cache -t btc-bot:latest .
 docker rm -f btc-bot 2>/dev/null || true
 docker run -d --name btc-bot --restart=always \
   -e ADMIN_HOST=0.0.0.0 -e ADMIN_PORT=8080 \
+  -e SEED_QUOTE=USD -e SEED_AMOUNT=20000 \
+  -e REPORT_EVERY=60 \
   -p 8080:8080 \
   btc-bot:latest
 
@@ -38,11 +40,22 @@ sudo systemctl status docker --no-pager
 
 curl -X POST http://127.0.0.1:8080/bots \
   -H "Content-Type: application/json" \
-  -d '{"symbol":"BTCUSD","venue":"us","buy_gap_pct":0.1,"sell_gap_pct":0.1}'
+  -d '{
+        "symbol": "ETHUSD",
+        "venue": "us",
+        "buy_gap_pct": 0.2,
+        "sell_gap_pct": 0.2,
+        "min_profit_pct": 0.1,
+        "order_ttl_sec": 28800,
+        "fee_rate": 0.0001,
+        "init_base": 0,
+        "init_quote": 2000,
+        "bot_lifetime_sec": 0,
+        "respawn_wait_sec": 0
+      }'
 
-curl -X POST http://127.0.0.1:8080/bots \
-  -H "Content-Type: application/json" \
-  -d '{"symbol":"ETHUSD","venue":"us","buy_gap_pct":0.1,"sell_gap_pct":0.1}'
+curl http://127.0.0.1:8080/funds
+curl http://127.0.0.1:8080/bots
 
 # SSH
 The key fingerprint is:
