@@ -1,34 +1,53 @@
 
+cat > Dockerfile <<'EOF'
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 TZ=America/New_York
+WORKDIR /bot
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates \
+  && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
+  && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+COPY bot_manager.py .
+EXPOSE 8080
+ENV REPORT_MODE=compact REPORT_EVERY=60 REPORT_MAX_OPEN=3 ADMIN_HOST=0.0.0.0 ADMIN_PORT=8080
+CMD ["python", "bot_manager.py"]
+EOF
+
+# requirements.txt
+cat > requirements.txt <<'EOF'
+aiohttp==3.9.5
+websockets==12.0
+EOF
+
 docker ps            # running containers
 docker ps -a         # all containers (stopped + running)
 docker inspect -f '{{.State.Status}}' btc-bot
 
-docker stop btc-bot
 
 # stop & remove current container
+docker stop btc-bot
 docker rm -f btc-bot
 
 # move new python file
+cd bot
+rm bot_manager.py
 mv ~/bot_manager.py ~/bot/
+dir
 
 # rebuild docker and run
 docker build --pull --no-cache -t btc-bot:latest .
 docker rm -f btc-bot 2>/dev/null || true
-docker run -d --name btc-bot --restart=always \
-  -e ADMIN_HOST=0.0.0.0 -e ADMIN_PORT=8080 \
+docker run -d --name btc-bot --restart unless-stopped \
   -p 8080:8080 \
-  --log-driver=gcplogs --log-opt gcp-log-cmd=true \
-  btc-bot:latest
-
-# rebuild docker and run
-docker build --pull --no-cache -t btc-bot:latest .
-docker rm -f btc-bot 2>/dev/null || true
-docker run -d --name btc-bot --restart=always \
-  -e ADMIN_HOST=0.0.0.0 -e ADMIN_PORT=8080 \
-  -e SEED_QUOTE=USD -e SEED_AMOUNT=20000 \
+  -e ADMIN_HOST=0.0.0.0 \
+  -e ADMIN_PORT=8080 \
+  -e REPORT_MODE=compact \
   -e REPORT_EVERY=60 \
-  -p 8080:8080 \
+  -e SEED_QUOTE=USD -e SEED_AMOUNT=20000 \
   btc-bot:latest
+
+--log-driver=gcplogs --log-opt gcp-log-cmd=true \
 
 # verify
 docker ps
@@ -44,15 +63,22 @@ curl -X POST http://127.0.0.1:8080/bots \
         "symbol": "ETHUSD",
         "venue": "us",
         "buy_gap_pct": 0.2,
-        "sell_gap_pct": 0.2,
-        "min_profit_pct": 0.1,
-        "order_ttl_sec": 28800,
-        "fee_rate": 0.0001,
-        "init_base": 0,
-        "init_quote": 2000,
-        "bot_lifetime_sec": 0,
-        "respawn_wait_sec": 0
+        "sell_gap_pct": 0.4,
+        "min_profit_pct": 0.2,
+        "order_expiry_seconds": 0,
+        "fee_rate": 0.001,
+        "starting_base_qty": 0,
+        "starting_quote_qty": 2000,
+        "buy_tranche_quote": 0,
+        "buy_tranche_pct": 0.5,
+        "momentum_enabled": true,
+        "momentum_breakout_pct": 0.5,
+        "momentum_seed_quote": 300,
+        "momentum_max_seeds": 1
       }'
+
+Or use percentage per BUY (e.g., 25% of whatever quote is free):
+
 
 curl http://127.0.0.1:8080/funds
 curl http://127.0.0.1:8080/bots

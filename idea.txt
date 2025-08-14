@@ -1,0 +1,20 @@
+Ways to handle a persistent uptrend (no code yet—just options)
+Pick the ones you like and I can ship a full updated file:
+
+Enable trailing reprice (already supported):
+Set order_expiry_seconds to something like 300–900s so stale BUYs auto-cancel and reprice below the new spot. This lets you catch shallow pullbacks during a grind-up.
+
+Seed a tiny base so you can place SELLs immediately:
+Start bots with a small starting_base_qty (e.g., 0.01 ETH). Then the bot can place an initial SELL even before any BUY fills, so you participate in upside.
+
+Momentum entry (“breakout buy”)
+Add a rule: if price rises X% from the time the bot started without any fill, place a small market/near-market BUY to seed inventory and start the sell ladder.
+
+Laddered BUYs (grid) instead of single BUY
+Place multiple staggered BUYs (e.g., -0.2%, -0.6%, -1.2% …) with a cap on total quote allocation. In uptrends you’re more likely to get at least one partial fill on shallow dips.
+
+Dynamic gaps
+Shrink buy_gap_pct when volatility is low or when the order has expired N times, so the trailing BUY hugs price a bit more aggressively.
+
+Max-staleness guard (time + distance)
+Cancel & reprice if either (a) order age > TTL, or (b) spot moved up more than Y% from when the BUY was placed.
