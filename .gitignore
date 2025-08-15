@@ -4,3 +4,6 @@
 *.py[cod]
 *$py.class
 *.so
+
+gpt.txt
+idea.txt
