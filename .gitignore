@@ -5,5 +5,5 @@
 *$py.class
 *.so
 
-gpt.txt
-idea.txt
+/gpt.txt
+/idea.txt

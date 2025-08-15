@@ -1,4 +1,5 @@
 websockets>=12.0
 aiohttp>=3.9
+pytz==2024.1
 # optional:
 # python-dotenv>=1.0   # if you later load keys/config from .env (not used below)

@@ -1,1091 +1,698 @@
-# bot_manager.py
-# Python 3.10+
-# Paper-trading bots with HTTP admin, WS price feed, centralized FundManager,
-# fee-aware order sizing, tranche buys, optional momentum seed, and compact
-# global reporting (with price trails) in EST.
+#!/usr/bin/env python3
+# bot_manager.py (updated Δ→last to use last price as denominator)
+# See previous description; two-branch engine (CORE + MOMO), gap-only orders, repricing, compact report.
 
-from __future__ import annotations
-
+import os
 import asyncio
 import json
-import logging
-import random
-import signal
-import argparse
-import os
 import time
+import math
+import signal
+import uuid
+import logging
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Optional, Callable, List, Tuple
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from collections import deque
+from typing import Optional, Dict, List, Any, Tuple
 
+import aiohttp
 from aiohttp import web
 import websockets
-from websockets.exceptions import ConnectionClosed
+import contextlib
 
-# ---------- timezone helpers (EST/EDT) ----------
-NY = ZoneInfo("America/New_York")
+# --------------------------- Config & Utilities ---------------------------
 
-def now_est() -> datetime:
-    return datetime.now(tz=NY)
+TZ = os.environ.get("TZ", "America/New_York")
+REPORT_MODE = os.environ.get("REPORT_MODE", "compact")
+REPORT_EVERY = int(os.environ.get("REPORT_EVERY", "60"))
+REPORT_MAX_OPEN = int(os.environ.get("REPORT_MAX_OPEN", "3"))
+REPORT_TICK_HISTORY = int(os.environ.get("REPORT_TICK_HISTORY", "5"))
 
-def ts_est() -> str:
-    return now_est().isoformat(timespec="seconds")
+ADMIN_HOST = os.environ.get("ADMIN_HOST", "0.0.0.0")
+ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8080"))
 
-def format_epoch_est(epoch: float | None) -> str:
-    if not epoch:
-        return "n/a"
-    return datetime.fromtimestamp(epoch, tz=NY).isoformat(timespec="seconds")
+SEED_QUOTE = os.environ.get("SEED_QUOTE", "USD")
+SEED_AMOUNT = float(os.environ.get("SEED_AMOUNT", "20000"))
 
-def format_time_hms_est(epoch: float | None) -> str:
-    if not epoch:
-        return "n/a"
-    return datetime.fromtimestamp(epoch, tz=NY).strftime("%H:%M:%S")
+PRICE_HISTORY_MINUTES = 10  # keep 10-minute global history for start→end line
 
-def format_duration_dhms(seconds: float) -> str:
-    s = int(max(0, seconds))
-    days, rem = divmod(s, 86400)
-    hrs, rem = divmod(rem, 3600)
-    mins, secs = divmod(rem, 60)
-    parts = []
-    if days: parts.append(f"{days}d")
-    parts.append(f"{hrs}h")
-    parts.append(f"{mins}m")
-    parts.append(f"{secs}s")
-    return " ".join(parts)
+def fmt_money(v: float) -> str:
+    try:
+        return f"${v:,.2f}"
+    except Exception:
+        return f"${v}"
 
-# ---------------------------- logging ----------------------------
-def setup_logging(level: int = logging.INFO) -> None:
-    fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    datefmt = "%H:%M:%S"
-    logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
+def fmt_qty(v: float, places: int = 6) -> str:
+    s = f"{v:.{places}f}"
+    s = s.rstrip('0').rstrip('.')
+    return s if s else "0"
 
-# ---------------------------- config -----------------------------
-@dataclass
-class BotConfig:
-    name: str
-    tick_seconds: float = 1.0
-    max_backoff: float = 30.0
-    jitter: float = 0.2
-    params: Dict[str, Any] = field(default_factory=dict)
+def fmt_delta(last: float, limit: float) -> str:
+    # kept for other uses; not used for order Δ lines
+    d = last - limit
+    pct = (d / limit) * 100.0 if limit else 0.0
+    sign = "+" if d >= 0 else ""
+    return f"{sign}{d:.2f} ({sign}{pct:.2f}%)"
 
-def d(x) -> Decimal:
-    return Decimal(str(x))
+def fmt_gap_from_last(last: float, limit: float) -> str:
+    # Display the price gap relative to the current last price (matches gap params)
+    d = last - limit  # positive if last > limit
+    pct = (d / last) * 100.0 if last else 0.0
+    sign = "+" if d >= 0 else ""
+    return f"{sign}{d:.2f} ({sign}{pct:.2f}%)"
 
-# ----------------------- centralized fund manager ----------------
+def now_est_str() -> str:
+    import datetime, pytz
+    return datetime.datetime.now(pytz.timezone(TZ)).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def clamp_price_below_last(target: float, last: float, tick: float) -> float:
+    return min(target, last - tick)
+
+# --------------------------- Fund Manager ---------------------------
+
 class FundManager:
-    """Global pool of assets (e.g., {'USD': 20000, 'ETH': 0})."""
+    def __init__(self, quote_symbol: str, seed_amount: float):
+        self.quote_symbol = quote_symbol
+        self.pool_quote = seed_amount
+        self.balances: Dict[str, Dict[str, float]] = {}
+
+    def allocate(self, bot_name: str, quote: float, base: float = 0.0):
+        if quote > self.pool_quote:
+            raise ValueError(f"Insufficient pool quote to allocate: need {quote}, have {self.pool_quote}")
+        self.pool_quote -= quote
+        self.balances[bot_name] = {"quote": quote, "base": base}
+
+    def sweep_back(self, bot_name: str, quote: float, base: float):
+        self.pool_quote += quote
+        self.balances.pop(bot_name, None)
+
+    def get_bot_balances(self, bot_name: str) -> Tuple[float, float]:
+        bal = self.balances.get(bot_name, {"quote": 0.0, "base": 0.0})
+        return bal["quote"], bal["base"]
+
+    def set_bot_balances(self, bot_name: str, quote: float, base: float):
+        if bot_name not in self.balances:
+            self.balances[bot_name] = {"quote": 0.0, "base": 0.0}
+        self.balances[bot_name]["quote"] = quote
+        self.balances[bot_name]["base"] = base
+
+    def funds_summary(self) -> Dict[str, Any]:
+        return {"pool_quote": self.pool_quote, "quote_symbol": self.quote_symbol, "bots": self.balances}
+
+# --------------------------- Price Feed ---------------------------
+
+class PriceFeed:
     def __init__(self):
-        self._bal: Dict[str, Decimal] = {}
-        self._lock = asyncio.Lock()
+        self.last_price: Dict[str, float] = {}
+        self.listeners: Dict[str, List] = defaultdict(list)
+        self.ws_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+        self._stop = False
 
-    def seed(self, asset: str, amt: Decimal) -> None:
-        self._bal[asset] = self._bal.get(asset, d("0")) + amt
+    def get_last(self, symbol: str) -> Optional[float]:
+        return self.last_price.get(symbol)
 
-    async def deposit(self, asset: str, amt: Decimal) -> None:
-        async with self._lock:
-            self._bal[asset] = self._bal.get(asset, d("0")) + amt
+    def subscribe(self, venue: str, symbol: str, on_price):
+        key = (venue, symbol.upper())
+        self.listeners[symbol.upper()].append(on_price)
+        if key not in self.ws_tasks:
+            self.ws_tasks[key] = asyncio.create_task(self._run_ws(venue, symbol.upper()))
 
-    async def allocate(self, want: Dict[str, Decimal]) -> Dict[str, Decimal]:
-        async with self._lock:
-            out: Dict[str, Decimal] = {}
-            for asset, amt in want.items():
-                cur = self._bal.get(asset, d("0"))
-                take = min(cur, amt)
-                self._bal[asset] = cur - take
-                out[asset] = take
-            return out
-
-    async def balances(self) -> Dict[str, Decimal]:
-        async with self._lock:
-            return dict(self._bal)
-
-# --------------------------- report hub --------------------------
-class ReportHub:
-    def __init__(self):
-        self._snapshots: Dict[str, Dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-
-    async def put(self, bot_name: str, snap: Dict[str, Any]) -> None:
-        async with self._lock:
-            self._snapshots[bot_name] = snap
-
-    async def clear(self, bot_name: str) -> None:
-        async with self._lock:
-            self._snapshots.pop(bot_name, None)
-
-    async def all(self) -> Dict[str, Dict[str, Any]]:
-        async with self._lock:
-            return dict(self._snapshots)
-
-# ---------------------------- base bot ---------------------------
-class BaseBot:
-    def __init__(self, cfg: BotConfig):
-        self.cfg = cfg
-        self.log = logging.getLogger(f"bot.{cfg.name}")
-        self._stop = asyncio.Event()
-        self._started_ts: Optional[float] = None
-        life = cfg.params.get("bot_lifetime_seconds", 0) or 0
-        self.lifetime_sec: Optional[int] = int(life) if life else None
-
-    async def on_start(self) -> None: ...
-    async def on_stop(self) -> None: ...
-    async def on_tick(self) -> None: raise NotImplementedError
-
-    async def start(self) -> None:
-        self._started_ts = time.time()
-        self.log.info("starting (EST %s)", ts_est())
-        await self.on_start()
-
-    async def stop(self) -> None:
-        self.log.info("stopping (EST %s)", ts_est())
-        self._stop.set()
-        await self.on_stop()
-
-    def active_duration(self) -> float:
-        if self._started_ts is None:
-            return 0.0
-        return max(0.0, time.time() - self._started_ts)
-
-    async def run(self) -> None:
-        await self.start()
-        try:
-            while not self._stop.is_set():
-                if self.lifetime_sec and self.active_duration() >= self.lifetime_sec:
-                    self.log.info("lifetime reached (%ss), stopping", self.lifetime_sec)
-                    break
-                await self.on_tick()
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self.cfg.tick_seconds)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            await self.stop()
-
-# ----------------------- shared price bus ------------------------
-class PriceBus:
-    """Per-symbol last price store + short rolling history for reports."""
-    def __init__(self):
-        self._last: Dict[str, Decimal] = {}
-        self._cv = asyncio.Condition()
-        self._hist: Dict[str, deque] = {}
-        self._hist_len = int(os.getenv("REPORT_TICK_HISTORY", "5"))
-
-    async def set_last(self, symbol: str, last: Decimal) -> None:
-        symbol = symbol.upper()
-        async with self._cv:
-            self._last[symbol] = last
-            dq = self._hist.get(symbol)
-            if dq is None:
-                dq = deque(maxlen=self._hist_len)
-                self._hist[symbol] = dq
-            dq.append(last)
-            self._cv.notify_all()
-
-    async def wait_for_price(self, symbol: str, timeout: Optional[float] = None) -> Decimal:
-        symbol = symbol.upper()
-        async with self._cv:
-            if timeout is None:
-                while symbol not in self._last:
-                    await self._cv.wait()
-            else:
-                deadline = time.time() + timeout
-                while symbol not in self._last:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        raise TimeoutError(f"No price yet for {symbol}")
-                    await asyncio.wait_for(self._cv.wait(), timeout=remaining)
-            return self._last[symbol]
-
-    def get_last(self, symbol: str) -> Optional[Decimal]:
-        return self._last.get(symbol.upper())
-
-    def recent_prices(self, symbol: str, k: Optional[int] = None) -> List[Decimal]:
-        dq = self._hist.get(symbol.upper())
-        if not dq:
-            return []
-        if k is None or k >= len(dq):
-            return list(dq)
-        return list(dq)[-k:]
-
-# ----------------------- WebSocket price bot ---------------------
-class WSPriceBot(BaseBot):
-    """Subscribes to Binance(.com or .US) trade stream and updates PriceBus."""
-    def __init__(self, cfg: BotConfig):
-        super().__init__(cfg)
-        self.bus: PriceBus = cfg.params["bus"]
-        self.use_us: bool = bool(cfg.params.get("use_us", True))
-        self.symbols: List[str] = [s.upper() for s in cfg.params.get("symbols", [])]
-        if not self.symbols:
-            raise ValueError("WSPriceBot requires 'symbols'")
-        self._task: Optional[asyncio.Task] = None
-        self._stopping = False
-
-    def _ws_url(self) -> str:
-        host = "stream.binance.us:9443" if self.use_us else "stream.binance.com:9443"
-        streams = "/".join([f"{s.lower()}@trade" for s in self.symbols])
-        return f"wss://{host}/stream?streams={streams}"
-
-    async def _run_ws(self) -> None:
+    async def _run_ws(self, venue: str, symbol: str):
+        base_url = "wss://stream.binance.us:9443/ws" if venue.lower() == "us" else "wss://stream.binance.com:9443/ws"
+        url = f"{base_url}/{symbol.lower()}@trade"
         backoff = 1.0
-        while not self._stopping:
-            url = self._ws_url()
+        while not self._stop:
             try:
-                self.log.info("connecting %s (EST %s)", url, ts_est())
-                async with websockets.connect(url, ping_interval=15, ping_timeout=20) as ws:
-                    self.log.info("connected (EST %s)", ts_est())
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     backoff = 1.0
-                    async for raw in ws:
-                        if self._stopping:
-                            break
-                        try:
-                            msg = json.loads(raw)
-                            data = msg.get("data", msg)
-                            s = (data.get("s") or msg.get("stream", "").split("@")[0]).upper()
-                            p = data.get("p")
-                            if p is not None:
-                                await self.bus.set_last(s, Decimal(p))
-                        except Exception as parse_err:
-                            self.log.debug("parse error: %s", parse_err)
-            except (ConnectionClosed, OSError) as net_err:
-                self.log.warning("ws closed: %s", net_err)
-            if self._stopping:
-                break
-            jitter = 1 + random.uniform(-self.cfg.jitter, self.cfg.jitter)
-            delay = min(backoff * jitter, self.cfg.max_backoff)
-            self.log.info("reconnecting in %.1fs (EST %s)", delay, ts_est())
-            await asyncio.sleep(delay)
-            backoff = min(backoff * 2, self.cfg.max_backoff)
+                    while not self._stop:
+                        data = json.loads(await ws.recv())
+                        price = None
+                        if isinstance(data, dict):
+                            if "p" in data:
+                                try: price = float(data["p"])
+                                except: price = None
+                            elif "data" in data and isinstance(data["data"], dict) and "p" in data["data"]:
+                                try: price = float(data["data"]["p"])
+                                except: price = None
+                        if price and price > 0:
+                            self.last_price[symbol.upper()] = price
+                            for cb in list(self.listeners.get(symbol.upper(), [])):
+                                try: cb(price)
+                                except Exception as e: logging.exception("Listener error: %s", e)
+            except Exception as e:
+                logging.warning("WS connection error for %s on %s: %s", symbol, venue, e)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
-    async def on_start(self) -> None:
-        self._stopping = False
-        self._task = asyncio.create_task(self._run_ws())
+    async def stop(self):
+        self._stop = True
+        for task in self.ws_tasks.values(): task.cancel()
+        await asyncio.gather(*self.ws_tasks.values(), return_exceptions=True)
 
-    async def on_stop(self) -> None:
-        self._stopping = True
+# --------------------------- Trading Structures ---------------------------
+
+from dataclasses import dataclass, field
+
+@dataclass
+class Order:
+    id: str
+    side: str
+    price: float
+    qty: float
+    branch: str
+    is_momentum: bool = False
+    spent_quote: Optional[float] = None
+    created_ts: float = field(default_factory=lambda: time.time())
+
+@dataclass
+class BranchState:
+    name: str
+    open_buy: Optional[Order] = None
+    sell_orders: List[Order] = field(default_factory=list)
+    base_avail: float = 0.0
+    last_buy_fill_ts: Optional[float] = None
+    last_sell_fill_ts: Optional[float] = None
+    stage_count: int = 0
+    active: bool = False
+    reprices_count: int = 0
+    avg_cost: float = 0.0
+
+class Bot:
+    def __init__(self, manager, name: str, symbol: str, venue: str, params: Dict[str, Any], price_feed: PriceFeed):
+        self.manager = manager
+        self.name = name
+        self.symbol = symbol.upper()
+        self.venue = venue
+        self.params = params
+        self.price_feed = price_feed
+
+        q, b = manager.fund.get_bot_balances(self.name)
+        self.quote = q
+        self.base = b
+
+        self.core = BranchState(name="CORE")
+        self.momo = BranchState(name="MOMO")
+        self.momo_ref: Optional[float] = None
+
+        self.tick_prices: deque = deque(maxlen=REPORT_TICK_HISTORY)
+        self.minute_prices: deque = deque(maxlen=10)
+
+        self.nav_baseline: Optional[float] = None
+
+        self._stop = False
+        self._task: Optional[asyncio.Task] = None
+
+        self.price_feed.subscribe(self.venue, self.symbol, self._on_price)
+
+    def start(self):
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    async def stop(self):
+        self._stop = True
         if self._task:
             self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            with contextlib.suppress(Exception): await self._task
+        last = self.price_feed.get_last(self.symbol) or 0.0
+        sweep_quote = self.quote
+        total_base = self.core.base_avail + self.momo.base_avail
+        if last > 0 and total_base > 0:
+            sweep_quote += total_base * last
+        self.core = BranchState(name="CORE")
+        self.momo = BranchState(name="MOMO")
+        self.manager.fund.sweep_back(self.name, sweep_quote, 0.0)
 
-    async def on_tick(self) -> None:
-        pass
+    def _on_price(self, price: float):
+        self.tick_prices.append(price)
 
-# ----------------------- Paper trading pieces --------------------
-@dataclass
-class PaperOrder:
-    orderId: int
-    side: str      # "BUY" / "SELL"
-    price: Decimal
-    qty: Decimal
-    status: str = "NEW"      # NEW, FILLED, CANCELED
-    executedQty: Decimal = d("0")
-    tag: str = ""            # "momentum" or ""
-    last_ts: float = 0.0     # epoch seconds (last action)
+    async def _run(self):
+        min_tick = self.params.get("price_tick", 0.01)
+        qty_tick = self.params.get("qty_tick", 1e-6)
+        buy_gap_pct = float(self.params.get("buy_gap_pct", 0.2))
+        sell_gap_pct = float(self.params.get("sell_gap_pct", 0.4))
+        min_profit_pct = float(self.params.get("min_profit_pct", 0.2))
+        order_expiry_seconds = int(self.params.get("order_expiry_seconds", 0))
+        fee_rate = float(self.params.get("fee_rate", 0.0))
 
-@dataclass
-class PaperBroker:
-    base_bal: Decimal
-    quote_bal: Decimal
-    fee_rate: Decimal
-    tick: Decimal
-    step: Decimal
-    min_qty: Decimal
-    min_notional: Decimal
-    next_id: int = 1
-    orders: Dict[int, PaperOrder] = field(default_factory=dict)
+        buy_tranche_quote = float(self.params.get("buy_tranche_quote", 0.0))
+        buy_tranche_pct = float(self.params.get("buy_tranche_pct", 0.5))
 
-    def _round_down(self, val: Decimal, quantum: Decimal) -> Decimal:
-        if quantum == 0: return val
-        q = (val / quantum).to_integral_value(rounding=ROUND_DOWN)
-        return q * quantum
+        momentum_enabled = bool(self.params.get("momentum_enabled", True))
+        momentum_breakout_pct = float(self.params.get("momentum_breakout_pct", 0.5))
 
-    def _touch(self, o: PaperOrder) -> None:
-        o.last_ts = time.time()
+        bot_lifetime_seconds = int(self.params.get("bot_lifetime_seconds", 0))
+        start_ts = time.time()
 
-    def place_limit(self, side: str, price: Decimal, qty: Decimal, tag: str = "") -> PaperOrder:
-        price = self._round_down(price, self.tick)
-        qty   = self._round_down(qty, self.step)
-        if qty < self.min_qty or (price * qty) < self.min_notional:
-            raise ValueError("Order below exchange minimums")
-        oid = self.next_id; self.next_id += 1
-        o = PaperOrder(oid, side, price, qty, tag=tag, last_ts=time.time())
-        self.orders[oid] = o
-        return o
+        while not self._stop:
+            last = self.price_feed.get_last(self.symbol)
+            if last and last > 0:
+                if self.momo_ref is None: self.momo_ref = last
+                if self.nav_baseline is None:
+                    self.nav_baseline = self.quote + (self.core.base_avail + self.momo.base_avail) * last
+                break
+            await asyncio.sleep(0.1)
 
-    def cancel_side(self, side: str) -> int:
-        n = 0
-        for o in self.orders.values():
-            if o.status == "NEW" and o.side == side:
-                o.status = "CANCELED"; self._touch(o); n += 1
-        return n
-
-    def cancel_all(self) -> int:
-        n = 0
-        for o in self.orders.values():
-            if o.status == "NEW":
-                o.status = "CANCELED"; self._touch(o); n += 1
-        return n
-
-    def open_by_side(self, side: str) -> List[PaperOrder]:
-        return [o for o in self.orders.values() if o.status == "NEW" and o.side == side]
-
-    def open_qty(self, side: str) -> Decimal:
-        return sum(o.qty for o in self.orders.values() if o.status == "NEW" and o.side == side) or d("0")
-
-    def mark_price(self, last: Decimal, log: logging.Logger) -> List[PaperOrder]:
-        """Auto-fill on last: BUY if last <= limit; SELL if last >= limit."""
-        filled: List[PaperOrder] = []
-        for o in list(self.orders.values()):
-            if o.status != "NEW":
-                continue
-            can_fill = (last <= o.price) if o.side == "BUY" else (last >= o.price)
-            if not can_fill:
-                log.debug("NO FILL: %s #%s limit=%s last=%s qty=%s", o.side, o.orderId, o.price, last, o.qty)
+        while not self._stop:
+            last = self.price_feed.get_last(self.symbol)
+            now = time.time()
+            if not last or last <= 0:
+                await asyncio.sleep(0.1)
                 continue
 
-            if o.side == "BUY":
-                notional = o.price * o.qty
-                fee = notional * self.fee_rate
-                if self.quote_bal >= (notional + fee):
-                    before_q, before_b = self.quote_bal, self.base_bal
-                    self.quote_bal -= (notional + fee)
-                    self.base_bal  += o.qty
-                    o.status = "FILLED"; o.executedQty = o.qty; self._touch(o)
-                    filled.append(o)
-                    log.info("FILL: BUY #%s @ %s qty=%s last=%s notional=%s fee=%s "
-                             "bal USD %s->%s BASE %s->%s %s (EST %s)",
-                             o.orderId, o.price, o.qty, last, notional, fee,
-                             before_q, self.quote_bal, before_b, self.base_bal,
-                             f'[{o.tag}]' if o.tag else '', ts_est())
-                else:
-                    log.debug("NO FILL: BUY #%s insufficient quote %s < %s+%s",
-                              o.orderId, self.quote_bal, notional, fee)
+            if momentum_enabled and self.momo.open_buy is None:
+                self.momo_ref = max(self.momo_ref or last, last)
+
+            if self.core.open_buy is None:
+                self._maybe_place_core_buy(last, buy_gap_pct, fee_rate, buy_tranche_quote, buy_tranche_pct, min_tick, qty_tick)
             else:
-                if self.base_bal >= o.qty:
-                    gross = o.price * o.qty
-                    fee = gross * self.fee_rate
-                    before_q, before_b = self.quote_bal, self.base_bal
-                    self.base_bal  -= o.qty
-                    self.quote_bal += (gross - fee)
-                    o.status = "FILLED"; o.executedQty = o.qty; self._touch(o)
-                    filled.append(o)
-                    log.info("FILL: SELL #%s @ %s qty=%s last=%s gross=%s fee=%s "
-                             "bal USD %s->%s BASE %s->%s (EST %s)",
-                             o.orderId, o.price, o.qty, last, gross, fee,
-                             before_q, self.quote_bal, before_b, self.base_bal,
-                             ts_est())
+                self._reprice_buy(self.core, last, buy_gap_pct, min_tick, reset_ttl=False)
+            self._maybe_place_core_sells(last, sell_gap_pct, min_profit_pct, fee_rate, min_tick, qty_tick)
+
+            if momentum_enabled:
+                if self.momo.open_buy is None:
+                    if self._breakout_triggered(last, self.momo_ref, momentum_breakout_pct):
+                        self._maybe_place_momo_buy(last, buy_gap_pct, fee_rate, buy_tranche_quote, buy_tranche_pct, min_tick, qty_tick)
                 else:
-                    log.debug("NO FILL: SELL #%s insufficient base %s < %s",
-                              o.orderId, self.base_bal, o.qty)
-        return filled
+                    self._reprice_buy(self.momo, last, buy_gap_pct, min_tick, reset_ttl=False)
+                self._maybe_place_momo_sells(last, sell_gap_pct, min_profit_pct, fee_rate, min_tick, qty_tick)
 
-    def sweep_balances(self) -> Tuple[Decimal, Decimal]:
-        b, q = self.base_bal, self.quote_bal
-        self.base_bal = d("0")
-        self.quote_bal = d("0")
-        return b, q
+            self._simulate_fills(self.core, last, fee_rate, min_tick, qty_tick, order_expiry_seconds)
+            self._simulate_fills(self.momo, last, fee_rate, min_tick, qty_tick, order_expiry_seconds)
 
-# ----------------------- Paper trading bot ----------------------
-class PaperTradingBot(BaseBot):
-    """
-    - Keep exactly ONE working BUY (repriced on events). SELLs are placed from available base; NOT canceled on BUY fill.
-    - order_expiry_seconds = TTL for orders (0 = never auto-cancel).
-    - BUY tranche budgeting via buy_tranche_quote or buy_tranche_pct (fee-aware sizing).
-    - Minimal momentum seed (one-time) if price breaks out with no prior BUY fills.
-    - On stop: cancel all, return funds to pool.
-    """
-    def __init__(self, cfg: BotConfig):
-        super().__init__(cfg)
-        p = cfg.params
-        self.bus: PriceBus = p["bus"]
-        self.fund_mgr: FundManager = p["fund_mgr"]
-        self.hub: ReportHub = p["hub"]
-        self.symbol: str = p["symbol"].upper()
-        flt = p["filters"]
-        self.broker = PaperBroker(
-            base_bal=d(p["balances"]["base"]),
-            quote_bal=d(p["balances"]["quote"]),
-            fee_rate=d(p.get("fee_rate", 0.0)),
-            tick=d(flt["tick"]), step=d(flt["step"]),
-            min_qty=d(flt["min_qty"]), min_notional=d(flt["min_notional"]),
-        )
-        self.buy_gap = Decimal(str(p["gaps"]["buy_gap_pct"])) / Decimal("100")
-        self.sell_gap = Decimal(str(p["gaps"]["sell_gap_pct"])) / Decimal("100")
-        self.min_profit = Decimal(str(p.get("min_profit_pct", p["gaps"]["sell_gap_pct"]))) / Decimal("100")
-        self.order_ttl = int(p.get("order_expiry_seconds", 0))
+            self._maybe_close_momo_branch(last)
 
-        # BUY tranche sizing
-        self.buy_tranche_quote: Decimal = d(p.get("buy_tranche_quote", "0"))
-        self.buy_tranche_pct: Decimal = Decimal(str(p.get("buy_tranche_pct", 0.25)))
-        if self.buy_tranche_pct <= 0 or self.buy_tranche_pct > 1:
-            self.buy_tranche_pct = Decimal("0.25")
-
-        # Momentum (optional, one-shot)
-        self.momentum_enabled: bool = bool(p.get("momentum_enabled", True))
-        self.momentum_breakout_pct: Decimal = Decimal(str(p.get("momentum_breakout_pct", 1.0)))
-        self.momentum_seed_quote: Decimal = d(p.get("momentum_seed_quote", 50))
-        self.momentum_max_seeds: int = int(p.get("momentum_max_seeds", 1))
-        self._momentum_ref_price: Optional[Decimal] = None
-        self._momentum_seeds_used: int = 0
-        self._any_buy_ever_filled: bool = False
-
-        # last-fill memory (for compact report)
-        self._last_buy_fill_px: Optional[Decimal] = None
-        self._last_buy_fill_ts: Optional[float] = None
-        self._last_buy_fill_m: bool = False
-        self._last_sell_fill_px: Optional[Decimal] = None
-        self._last_sell_fill_ts: Optional[float] = None
-
-        self.account_quote = self._quote_for_symbol(self.symbol)
-        self._allocated_quote = d(p["balances"]["quote"])
-        self._allocated_base  = d(p["balances"]["base"])
-        self._allocation_done = False
-
-        self.last_buy_price: Optional[Decimal] = None
-        self._placed_at: Dict[int, float] = {}
-        self._handled_fills: set[int] = set()
-
-        # Reporting / PnL
-        self._initial_equity: Optional[Decimal] = None
-        self._last_price: Optional[Decimal] = None
-
-        # Retrigger counters
-        self.stage: int = 0
-        self.retriggers: Dict[str, int] = {"buy_fill": 0, "sell_fill": 0, "ttl": 0, "ensure": 0}
-
-    async def on_start(self) -> None:
-        if not self._allocation_done:
-            want = {self.account_quote: self._allocated_quote, self._base_for_symbol(self.symbol): self._allocated_base}
-            got = await self.fund_mgr.allocate(want)
-            self.broker.quote_bal = got.get(self.account_quote, d("0"))
-            self.broker.base_bal  = got.get(self._base_for_symbol(self.symbol), d("0"))
-            self._allocation_done = True
-
-    async def on_stop(self) -> None:
-        try:
-            await self.hub.clear(self.cfg.name)
-        except Exception:
-            pass
-        n = self.broker.cancel_all()
-        self.log.info("canceled %s open orders (EST %s)", n, ts_est())
-        base_bal, quote_bal = self.broker.sweep_balances()
-        base_sym = self._base_for_symbol(self.symbol)
-        if base_bal > 0:
-            await self.fund_mgr.deposit(base_sym, base_bal)
-        if quote_bal > 0:
-            await self.fund_mgr.deposit(self.account_quote, quote_bal)
-
-    # ----------- helpers -----------
-    def _base_for_symbol(self, sym: str) -> str:
-        if sym.endswith("USDT"): return sym[:-4]
-        if sym.endswith("USD"):  return sym[:-3]
-        return sym[:-3]
-
-    def _quote_for_symbol(self, sym: str) -> str:
-        if sym.endswith("USDT"): return "USDT"
-        if sym.endswith("USD"):  return "USD"
-        return sym[-3:]
-
-    def _dp(self, q: Decimal) -> int:
-        e = -q.as_tuple().exponent
-        return max(0, int(e))
-
-    def _fmt(self, x: Decimal | None, places: int) -> str:
-        if x is None:
-            return "n/a"
-        q = Decimal(1).scaleb(-places)
-        return str(x.quantize(q))
-
-    def _track_placement(self, o: PaperOrder) -> None:
-        self._placed_at[o.orderId] = time.time()
-
-    def _can_place_buy(self) -> bool:
-        return self.broker.quote_bal >= self.broker.min_notional
-
-    def _fee_aware_qty(self, price: Decimal, quote_budget: Decimal) -> Decimal:
-        """Max qty such that price*qty*(1+fee) <= quote_budget, rounded to step."""
-        f = self.broker.fee_rate
-        if price <= 0:
-            return d("0")
-        spendable = quote_budget / (Decimal("1") + f)
-        qty = self.broker._round_down(spendable / price, self.broker.step)
-        while qty > 0 and (price * qty) * (Decimal("1") + f) > quote_budget:
-            qty = self.broker._round_down(qty - self.broker.step, self.broker.step)
-        return max(qty, d("0"))
-
-    def _ensure_single_buy(self, spot: Decimal, reason: str) -> None:
-        canceled = self.broker.cancel_side("BUY")
-        if canceled:
-            self.log.info("CANCEL %s BUY(s) before reprice [reason=%s] (EST %s)", canceled, reason, ts_est())
-        if not self._can_place_buy():
-            self.log.info("Skip BUY ensure (%s): insufficient quote", reason)
-            return
-
-        target_buy = spot * (Decimal("1") - self.buy_gap)
-
-        # tranche budget: absolute cap or percentage of free quote
-        if self.buy_tranche_quote > 0:
-            budget_cap = self.buy_tranche_quote
-        else:
-            budget_cap = self.broker.quote_bal * self.buy_tranche_pct
-        budget = min(self.broker.quote_bal, budget_cap)
-
-        # must at least meet exchange min notional incl. fee
-        min_needed = self.broker.min_notional * (Decimal("1") + self.broker.fee_rate)
-        if budget < min_needed:
-            self.log.info("Skip BUY ensure (%s): insufficient quote (budget=%s < need=%s)",
-                          reason, budget, min_needed)
-            return
-
-        qty = self._fee_aware_qty(target_buy, budget)
-        try:
-            o = self.broker.place_limit("BUY", target_buy, qty)
-        except ValueError as e:
-            self.log.info("Skip BUY ensure (%s): qty=%s price=%s -> %s", reason, qty, target_buy, e)
-            return
-        self._track_placement(o)
-        self.stage += 1
-        self.retriggers[reason] = self.retriggers.get(reason, 0) + 1
-        self.log.info("PLACE: BUY #%s @%s qty=%s (budget=%s) [reason=%s stage=%s] (EST %s)",
-                      o.orderId, o.price, o.qty, budget, reason, self.stage, ts_est())
-
-    def _price_trail_text(self, p_dp: int) -> Optional[str]:
-        recent = self.bus.recent_prices(self.symbol, int(os.getenv("REPORT_TICK_HISTORY", "5")))
-        if not recent:
-            return None
-        trail_str = " → ".join(self._fmt(p, p_dp) for p in recent)
-        if len(recent) >= 2:
-            start, end = recent[0], recent[-1]
-            pct = (end - start) / start * Decimal("100") if start else Decimal("0")
-            return f"{trail_str}  (Δ {self._fmt(pct, 4)}%)"
-        return trail_str
-
-    async def _publish_snapshot(self, price: Optional[Decimal]) -> None:
-        """Compact snapshot for global report."""
-        p_dp  = self._dp(self.broker.tick)
-        q_dp  = self._dp(self.broker.step)
-
-        if price is None:
-            price_str = None; pnl_str = None; pnl_pct_str = None
-        else:
-            price_str = self._fmt(price, p_dp)
-            equity = self.broker.base_bal * price + self.broker.quote_bal
-            if self._initial_equity is None:
-                self._initial_equity = equity
-            pnl = equity - self._initial_equity
-            pnl_pct = (pnl / self._initial_equity * Decimal("100")) if self._initial_equity > 0 else Decimal("0")
-            pnl_str = self._fmt(pnl, 2)
-            pnl_pct_str = self._fmt(pnl_pct, 4) + "%"
-
-        # open orders summary (counts, sums, momentum count)
-        open_buys = [o for o in self.broker.orders.values() if o.status=="NEW" and o.side=="BUY"]
-        open_sells= [o for o in self.broker.orders.values() if o.status=="NEW" and o.side=="SELL"]
-        buy_count = len(open_buys)
-        sell_count= len(open_sells)
-        buy_qty_sum = sum((o.qty for o in open_buys), d("0"))
-        sell_qty_sum= sum((o.qty for o in open_sells), d("0"))
-        buy_m_count = sum(1 for o in open_buys if o.tag=="momentum")
-
-        # cap list of open orders for display
-        max_open = int(os.getenv("REPORT_MAX_OPEN", "3"))
-        def to_line(o: PaperOrder) -> str:
-            tag = "[M]" if o.tag=="momentum" else ""
-            side = f"{o.side}{tag}"
-            return f"{side} @ {self._fmt(o.price, p_dp)}  qty={self._fmt(o.qty, q_dp)}  placed {format_time_hms_est(o.last_ts)}"
-        open_display = [to_line(o) for o in sorted(open_buys+open_sells, key=lambda x: x.last_ts, reverse=True)[:max_open]]
-
-        snap = {
-            "name": self.cfg.name,
-            "symbol": self.symbol,
-            "price": price_str,
-            "price_trail": self._price_trail_text(p_dp),
-            "stage": self.stage,
-            "quote_sym": self._quote_for_symbol(self.symbol),
-            "base_sym": self._base_for_symbol(self.symbol),
-            "quote_bal": self._fmt(self.broker.quote_bal, 2),
-            "base_bal": self._fmt(self.broker.base_bal, q_dp),
-            "pnl": pnl_str if pnl_str is not None else "n/a",
-            "pnl_pct": pnl_pct_str if pnl_pct_str is not None else "n/a",
-            "active": format_duration_dhms(self.active_duration()),
-            "open_summary": {
-                "buy_count": buy_count,
-                "sell_count": sell_count,
-                "buy_qty_sum": self._fmt(buy_qty_sum, q_dp),
-                "sell_qty_sum": self._fmt(sell_qty_sum, q_dp),
-                "buy_momentum_count": buy_m_count,
-            },
-            "last_fills": {
-                "buy": (self._fmt(self._last_buy_fill_px, p_dp) if self._last_buy_fill_px is not None else None,
-                        format_time_hms_est(self._last_buy_fill_ts),
-                        self._last_buy_fill_m),
-                "sell": (self._fmt(self._last_sell_fill_px, p_dp) if self._last_sell_fill_px is not None else None,
-                         format_time_hms_est(self._last_sell_fill_ts)),
-            },
-            "open_display": open_display,
-        }
-        await self.hub.put(self.cfg.name, snap)
-
-    def _maybe_momentum_seed(self, spot: Decimal) -> None:
-        if not self.momentum_enabled: return
-        if self._any_buy_ever_filled: return
-        if self._momentum_seeds_used >= self.momentum_max_seeds: return
-        if self._momentum_ref_price is None:
-            self._momentum_ref_price = spot
-            return
-        threshold = self._momentum_ref_price * (Decimal("1") + self.momentum_breakout_pct / Decimal("100"))
-        if spot < threshold:
-            return
-
-        budget = min(self.momentum_seed_quote, self.broker.quote_bal)
-        qty = self._fee_aware_qty(spot, budget)
-        if qty < self.broker.min_qty or (spot * qty) < self.broker.min_notional:
-            self.log.info("Momentum: seed too small (qty=%s, notional=%s); skip", qty, spot*qty)
-            self._momentum_seeds_used += 1
-            return
-
-        try:
-            o = self.broker.place_limit("BUY", spot, qty, tag="momentum")
-            self._track_placement(o)
-            self.stage += 1
-            self.retriggers["ensure"] = self.retriggers.get("ensure", 0) + 1
-            self._momentum_seeds_used += 1
-            self.log.info("Momentum: PLACE BUY #%s @ %s qty=%s (budget≈%s) (EST %s)",
-                          o.orderId, spot, qty, spot*qty, ts_est())
-        except ValueError as e:
-            self.log.info("Momentum: cannot place seed BUY -> %s", e)
-            self._momentum_seeds_used += 1
-
-    # --------------- main tick ---------------
-    async def on_tick(self) -> None:
-        price = self.bus.get_last(self.symbol)
-        if price is None:
-            try:
-                price = await self.bus.wait_for_price(self.symbol, timeout=5)
-            except TimeoutError:
-                await self._publish_snapshot(None)
+            if bot_lifetime_seconds > 0 and (now - start_ts) >= bot_lifetime_seconds:
+                await self.stop()
                 return
 
-        self._last_price = price
-        equity = self.broker.base_bal * price + self.broker.quote_bal
-        if self._initial_equity is None:
-            self._initial_equity = equity
+            await asyncio.sleep(0.05)
 
-        # Momentum seed check (one-shot)
-        self._maybe_momentum_seed(price)
+    def _free_quote(self) -> float:
+        return max(0.0, self.quote)
 
-        # Mark fills
-        filled_now = self.broker.mark_price(price, self.log)
+    def _budget_for_buy(self, buy_tranche_quote: float, buy_tranche_pct: float) -> float:
+        if buy_tranche_quote > 0:
+            return min(buy_tranche_quote, self._free_quote())
+        return min(self._free_quote(), max(0.0, self._free_quote() * buy_tranche_pct))
 
-        for o in filled_now:
-            if o.side == "BUY":
-                self.last_buy_price = o.price
-                self._any_buy_ever_filled = True
-                self._last_buy_fill_px = o.price
-                self._last_buy_fill_ts = o.last_ts
-                self._last_buy_fill_m  = (o.tag == "momentum")
+    def _qty_for_budget(self, price: float, budget: float, fee_rate: float, qty_tick: float) -> float:
+        if price <= 0 or budget <= 0: return 0.0
+        qty = budget / (price * (1.0 + fee_rate))
+        steps = math.floor(qty / qty_tick)
+        return max(0.0, steps * qty_tick)
+
+    def _place_buy(self, branch: 'BranchState', last: float, buy_gap_pct: float, fee_rate: float,
+                   buy_tranche_quote: float, buy_tranche_pct: float, min_tick: float, qty_tick: float,
+                   is_momentum: bool) -> Optional['Order']:
+        budget = self._budget_for_buy(buy_tranche_quote, buy_tranche_pct)
+        if budget <= 0: return None
+        limit = clamp_price_below_last(last * (1.0 - buy_gap_pct / 100.0), last, min_tick)
+        qty = self._qty_for_budget(limit, budget, fee_rate, qty_tick)
+        if qty <= 0: return None
+        spent = limit * qty * (1.0 + fee_rate)
+        if spent > self._free_quote() + 1e-9: return None
+        order = Order(id=str(uuid.uuid4()), side="BUY", price=limit, qty=qty,
+                      branch=branch.name, is_momentum=is_momentum, spent_quote=round(spent, 2))
+        branch.open_buy = order
+        branch.active = True
+        return order
+
+    def _maybe_place_core_buy(self, last, buy_gap_pct, fee_rate, buy_tranche_quote, buy_tranche_pct, min_tick, qty_tick):
+        self._place_buy(self.core, last, buy_gap_pct, fee_rate, buy_tranche_quote, buy_tranche_pct, min_tick, qty_tick, is_momentum=False)
+
+    def _maybe_place_momo_buy(self, last, buy_gap_pct, fee_rate, buy_tranche_quote, buy_tranche_pct, min_tick, qty_tick):
+        self._place_buy(self.momo, last, buy_gap_pct, fee_rate, buy_tranche_quote, buy_tranche_pct, min_tick, qty_tick, is_momentum=True)
+
+    def _reprice_buy(self, branch: 'BranchState', last: float, buy_gap_pct: float, min_tick: float, reset_ttl: bool = False):
+        if branch.open_buy is None: return
+        target = clamp_price_below_last(last * (1.0 - buy_gap_pct / 100.0), last, min_tick)
+        if abs(branch.open_buy.price - target) >= min_tick:
+            branch.open_buy.price = round(target, 8)
+            branch.reprices_count += 1
+            if reset_ttl: branch.open_buy.created_ts = time.time()
+
+    def _place_sell_from_inventory(self, branch: 'BranchState', last: float, sell_gap_pct: float,
+                                   min_profit_pct: float, fee_rate: float, min_tick: float, qty_tick: float) -> Optional['Order']:
+        qty = math.floor(branch.base_avail / qty_tick) * qty_tick
+        if qty <= 0: return None
+        gap_target = last * (1.0 + sell_gap_pct / 100.0)
+        profit_target = branch.avg_cost * (1.0 + min_profit_pct / 100.0) if branch.avg_cost > 0 else gap_target
+        limit = max(gap_target, profit_target)
+        limit = max(min_tick, round(limit, 8))
+        order = Order(id=str(uuid.uuid4()), side="SELL", price=limit, qty=qty, branch=branch.name)
+        branch.sell_orders.append(order)
+        branch.active = True
+        return order
+
+    def _maybe_place_core_sells(self, last, sell_gap_pct, min_profit_pct, fee_rate, min_tick, qty_tick):
+        if self.core.base_avail > 0 and len(self.core.sell_orders) < 3:
+            self._place_sell_from_inventory(self.core, last, sell_gap_pct, min_profit_pct, fee_rate, min_tick, qty_tick)
+
+    def _maybe_place_momo_sells(self, last, sell_gap_pct, min_profit_pct, fee_rate, min_tick, qty_tick):
+        if self.momo.base_avail > 0 and len(self.momo.sell_orders) < 3:
+            self._place_sell_from_inventory(self.momo, last, sell_gap_pct, min_profit_pct, fee_rate, min_tick, qty_tick)
+
+    def _breakout_triggered(self, last: float, ref: Optional[float], breakout_pct: float) -> bool:
+        if ref is None or ref <= 0 or breakout_pct <= 0: return False
+        return last >= ref * (1.0 + breakout_pct / 100.0)
+
+    def _simulate_fills(self, branch: 'BranchState', last: float, fee_rate: float, min_tick: float, qty_tick: float, ttl: int):
+        now = time.time()
+        if branch.open_buy is not None:
+            o = branch.open_buy
+            expired = (ttl > 0 and now - o.created_ts >= ttl)
+            if expired:
+                branch.open_buy = None
             else:
-                self._last_sell_fill_px = o.price
-                self._last_sell_fill_ts = o.last_ts
+                if last <= o.price + 1e-12:
+                    spent = o.price * o.qty * (1.0 + fee_rate)
+                    self.quote -= spent
+                    branch.base_avail += o.qty
+                    if branch.avg_cost <= 0:
+                        branch.avg_cost = o.price
+                    else:
+                        total_qty = branch.base_avail
+                        if total_qty > 0:
+                            branch.avg_cost = ((branch.avg_cost * (total_qty - o.qty)) + (o.price * o.qty)) / total_qty
+                    branch.last_buy_fill_ts = now
+                    branch.open_buy = None
 
-        # SELL placement: allow multiple; use available base
-        available_base = self.broker.base_bal - self.broker.open_qty("SELL")
-        if available_base >= self.broker.min_qty and self.last_buy_price is not None:
-            floor = self.last_buy_price * (Decimal("1") + self.min_profit)
-            target_sell = max(self.last_buy_price * (Decimal("1") + self.sell_gap), floor)
-            qty = self.broker._round_down(available_base, self.broker.step)
-            try:
-                o = self.broker.place_limit("SELL", target_sell, qty)
-                self._track_placement(o)
-                self.log.info("PLACE: SELL #%s @%s qty=%s (available_base used) (EST %s)",
-                              o.orderId, target_sell, qty, ts_est())
-            except ValueError as e:
-                self.log.info("Skip SELL (available_base=%s): %s", available_base, e)
+        filled_ids = []
+        for s in branch.sell_orders:
+            expired = (ttl > 0 and now - s.created_ts >= ttl)
+            if expired:
+                filled_ids.append(s.id)
+                continue
+            if last >= s.price - 1e-12:
+                qty = s.qty
+                gross = s.price * qty
+                net = gross * (1.0 - fee_rate)
+                self.quote += net
+                branch.base_avail = max(0.0, branch.base_avail - qty)
+                branch.last_sell_fill_ts = now
+                filled_ids.append(s.id)
+        if filled_ids:
+            branch.sell_orders = [s for s in branch.sell_orders if s.id not in filled_ids]
 
-        # TTL cancellation
-        if self.order_ttl > 0:
-            now = time.time()
-            for o in [*self.broker.open_by_side("BUY"), *self.broker.open_by_side("SELL")]:
-                placed = self._placed_at.get(o.orderId)
-                if placed and (now - placed) >= self.order_ttl:
-                    o.status = "CANCELED"
-                    self.broker._touch(o)
-                    self._placed_at.pop(o.orderId, None)
-                    self.log.info("CANCEL: %s #%s (TTL %ss) (EST %s)",
-                                  o.side, o.orderId, self.order_ttl, ts_est())
+    def _maybe_close_momo_branch(self, last: float, dust_threshold: float = 1e-12):
+        has_open_buy = self.momo.open_buy is not None
+        has_sell = len(self.momo.sell_orders) > 0
+        has_inv = self.momo.base_avail > dust_threshold
+        if not has_open_buy and not has_sell and not has_inv:
+            if self.momo.active: self.momo.stage_count += 1
+            self.momo.active = False
+            self.momo_ref = last
 
-        # Ensure/reprice single BUY
-        if not self.broker.open_by_side("BUY"):
-            self._ensure_single_buy(price, reason="ensure")
+    # ------------------- Reporting -------------------
 
-        await self._publish_snapshot(self._last_price)
+    def snapshot(self) -> Dict[str, Any]:
+        last = self.price_feed.get_last(self.symbol) or 0.0
+        if len(self.minute_prices) == 0 or (time.time() - (self.minute_prices[-1][0] if self.minute_prices else 0)) >= 60 - 1e-6:
+            self.minute_prices.append((time.time(), float(last)))
 
-# -------------------------- supervisor + manager -----------------
-class BotSupervisor:
-    def __init__(self, factory: Callable[[BotConfig], BaseBot], cfg: BotConfig):
-        self.factory = factory
-        self.cfg = cfg
-        self.log = logging.getLogger(f"sup.{cfg.name}")
-        self._task: Optional[asyncio.Task] = None
+        nav = self.quote + (self.core.base_avail + self.momo.base_avail) * (last if last > 0 else 0.0)
+        pnl_abs = (nav - self.nav_baseline) if self.nav_baseline is not None else 0.0
+        pnl_pct = (pnl_abs / self.nav_baseline * 100.0) if (self.nav_baseline and self.nav_baseline != 0) else 0.0
 
-    async def start(self) -> None:
-        self._task = asyncio.create_task(self.factory(self.cfg).run())
+        momo_buy_count = 1 if (self.momo.open_buy is not None) else 0
+        open_orders_total = (1 if self.core.open_buy else 0) + len(self.core.sell_orders) + \
+                            (1 if self.momo.open_buy else 0) + len(self.momo.sell_orders)
 
-    async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        recent_orders: List[str] = []
+        def order_line(o: Order) -> str:
+            last_p = last if last > 0 else o.price
+            tag = " [M]" if (o.is_momentum and o.side == "BUY") else ""
+            tag = " [M]" if (o.is_momentum and o.side == "BUY") else ""
+            spent_txt = f", spent≈{fmt_money(o.spent_quote)}" if (o.side == "BUY" and o.spent_quote) else ""
+            return f"{o.side}{tag} @ {fmt_money(o.price)} qty={fmt_qty(o.qty)}{spent_txt} Δ→last={fmt_gap_from_last(last_p, o.price)}"
+        candidates: List[Tuple[float, Order]] = []
+        if self.core.open_buy: candidates.append((self.core.open_buy.created_ts, self.core.open_buy))
+        if self.momo.open_buy: candidates.append((self.momo.open_buy.created_ts, self.momo.open_buy))
+        for s in self.core.sell_orders: candidates.append((s.created_ts, s))
+        for s in self.momo.sell_orders: candidates.append((s.created_ts, s))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, o in candidates[:REPORT_MAX_OPEN]:
+            recent_orders.append(order_line(o))
+        # tick trail
+        tick_trail = list(self.tick_prices)
+        tick_entries = []
+        for i, p in enumerate(tick_trail):
+            if i == 0:
+                tick_entries.append(f"{fmt_qty(p, 2)}")
+            else:
+                prev = tick_trail[i - 1]
+                dpct = ((p - prev) / prev * 100.0) if prev else 0.0
+                sign = "+" if dpct >= 0 else ""
+                tick_entries.append(f"{fmt_qty(p, 2)} ({sign}{dpct:.2f}%)")
 
-class BotManager:
-    def __init__(self):
-        self.log = logging.getLogger("manager")
-        self._supers: Dict[str, BotSupervisor] = {}
-        self._meta: Dict[str, Tuple[Callable[[BotConfig], BaseBot], BotConfig]] = {}
-        self._started = False
-        self._lock = asyncio.Lock()
+        # 10-minute start→end (print only start and end)
+        start_end = "n/a"
+        if len(self.minute_prices) >= 2:
+            p0 = self.minute_prices[0][1]
+            p1 = self.minute_prices[-1][1]
+            d = p1 - p0
+            pct = (d / p0 * 100.0) if p0 else 0.0
+            sign = "+" if d >= 0 else ""
+            start_end = f"start={fmt_money(p0)} → end={fmt_money(p1)}  Δ={sign}{d:.2f} ({sign}{pct:.2f}%)"
 
-    def add(self, name: str, factory: Callable[[BotConfig], BaseBot], cfg: BotConfig) -> None:
-        if name in self._supers:
-            raise ValueError(f"bot '{name}' exists")
-        self._supers[name] = BotSupervisor(factory, cfg)
-        self._meta[name] = (factory, cfg)
+        return {
+            "symbol": self.symbol,
+            "last": last,
+            "quote": self.quote,
+            "core_base": self.core.base_avail,
+            "momo_base": self.momo.base_avail,
+            "pnl_abs": pnl_abs,
+            "pnl_pct": pnl_pct,
+            "core_stage": self.core.stage_count,
+            "momo_stage": self.momo.stage_count,
+            "open_orders_total": open_orders_total,
+            "momo_open_buy_count": momo_buy_count,
+            "last_buy_fill_ts": max([t for t in [self.core.last_buy_fill_ts, self.momo.last_buy_fill_ts] if t] + [0.0]) if (self.core.last_buy_fill_ts or self.momo.last_buy_fill_ts) else None,
+            "last_sell_fill_ts": max([t for t in [self.core.last_sell_fill_ts, self.momo.last_sell_fill_ts] if t] + [0.0]) if (self.core.last_sell_fill_ts or self.momo.last_sell_fill_ts) else None,
+            "recent_orders": recent_orders,
+            "tick_entries": tick_entries,
+            "ten_minute": start_end,
+        }
 
-    async def add_and_start(self, name: str, factory: Callable[[BotConfig], BaseBot], cfg: BotConfig) -> None:
-        async with self._lock:
-            if name in self._supers:
-                raise ValueError(f"bot '{name}' exists")
-            sup = BotSupervisor(factory, cfg)
-            self._supers[name] = sup
-            self._meta[name] = (factory, cfg)
-            if self._started:
-                await sup.start()
+    def render_compact(self) -> str:
+        ss = self.snapshot()
+        lines = []
+        lines.append("=" * 60)
+        lines.append(f"{now_est_str()}  |  {ss['symbol']}")
+        lines.append("")
+        lines.append(f"Price(10m): {ss['ten_minute']}")
+        lines.append("")
+        lines.append(f"Stage: Core={ss['core_stage']}  Momo={ss['momo_stage']}   |   Uptime: (since-start)")
+        lines.append(f"Funds: {fmt_money(ss['quote'])}  /  Core:{fmt_qty(ss['core_base'])} {self.symbol}  Momo:{fmt_qty(ss['momo_base'])} {self.symbol}")
+        lines.append(f"PnL: {fmt_money(ss['pnl_abs'])}  ({ss['pnl_pct']:.2f}%)")
+        lines.append("")
+        core_lines = []
+        if self.core.open_buy:
+            o = self.core.open_buy
+            tag = " [M]" if (o.is_momentum and o.side == "BUY") else ""
+            core_lines.append(f"  BUY{tag} @ {fmt_money(o.price)} qty={fmt_qty(o.qty)}{', spent≈'+fmt_money(o.spent_quote) if o.spent_quote else ''} Δ→last={fmt_gap_from_last(ss['last'], o.price)}")
+        for s in self.core.sell_orders:
+            core_lines.append(f"  SELL @ {fmt_money(s.price)} qty={fmt_qty(s.qty)} Δ→last={fmt_gap_from_last(ss['last'], s.price)}")
 
-    async def remove_and_stop(self, name: str) -> bool:
-        async with self._lock:
-            sup = self._supers.pop(name, None)
-        if not sup:
-            return False
-        await sup.stop()
-        return True
+        momo_lines = []
+        if self.momo.open_buy:
+            o = self.momo.open_buy
+            tag = " [M]" if (o.is_momentum and o.side == "BUY") else ""
+            momo_lines.append(f"  BUY{tag} @ {fmt_money(o.price)} qty={fmt_qty(o.qty)}{', spent≈'+fmt_money(o.spent_quote) if o.spent_quote else ''} Δ→last={fmt_gap_from_last(ss['last'], o.price)}")
+        for s in self.momo.sell_orders:
+            momo_lines.append(f"  SELL [M] @ {fmt_money(s.price)} qty={fmt_qty(s.qty)} Δ→last={fmt_gap_from_last(ss['last'], s.price)}")
 
-    def get_meta(self, name: str) -> Optional[Tuple[Callable[[BotConfig], BaseBot], BotConfig]]:
-        return self._meta.get(name)
+        total_open = len(core_lines) + len(momo_lines)
+        lines.append(f"Open Orders ({total_open} total, {1 if self.momo.open_buy else 0} momentum BUY):")
+        if core_lines:
+            lines.append("  Core:")
+            lines.extend(core_lines)
+        if momo_lines:
+            lines.append("  Momentum:")
+            lines.extend(momo_lines)
 
-    def list_names(self) -> List[str]:
-        return sorted(self._supers.keys())
+        lb = max([t for t in [self.core.last_buy_fill_ts, self.momo.last_buy_fill_ts] if t] + [0.0]) if (self.core.last_buy_fill_ts or self.momo.last_buy_fill_ts) else 0.0
+        ls = max([t for t in [self.core.last_sell_fill_ts, self.momo.last_sell_fill_ts] if t] + [0.0]) if (self.core.last_sell_fill_ts or self.momo.last_sell_fill_ts) else 0.0
+        if lb or ls:
+            lines.append("")
+            lines.append("Last fills:")
+            if lb: lines.append(f"  BUY  {time.strftime('%H:%M:%S', time.localtime(lb))}")
+            if ls: lines.append(f"  SELL {time.strftime('%H:%M:%S', time.localtime(ls))}")
 
-    async def start(self) -> None:
-        self._started = True
-        for sup in self._supers.values():
-            await sup.start()
+        if ss["tick_entries"]:
+            lines.append("")
+            lines.append("------------------------------------------------------------")
+            lines.append("Price trail (last ticks, Δ%):")
+            lines.append("  " + " | ".join(ss["tick_entries"]))
 
-    async def stop(self) -> None:
-        await asyncio.gather(*(sup.stop() for sup in self._supers.values()))
-
-    async def run(self) -> None:
-        loop = asyncio.get_running_loop()
-        stop_ev = asyncio.Event()
-
-        def _signal(*_: Any) -> None:
-            self.log.warning("signal received; shutting down…")
-            stop_ev.set()
-
-        for s in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(s, _signal)
-            except NotImplementedError:
-                pass
-
-        await self.start()
-        await stop_ev.wait()
-        await self.stop()
-
-# --------------------------- admin HTTP --------------------------
-class AdminHTTP:
-    """
-    Endpoints:
-      GET  /bots
-      POST /bots
-      DELETE /bots/{name}
-      GET  /funds
-    """
-    def __init__(self, mgr: BotManager, bus: PriceBus, funds: FundManager, hub: ReportHub):
-        self.mgr = mgr
-        self.bus = bus
-        self.funds = funds
-        self.hub = hub
-        self.log = logging.getLogger("admin")
-        self.token = os.getenv("ADMIN_TOKEN")  # optional
-        self.filters_default = {"tick":"0.01","step":"0.000001","min_qty":"0.00001","min_notional":"10.0"}
-        self.report_every = int(os.getenv("REPORT_EVERY", "60"))
-        self.report_mode = os.getenv("REPORT_MODE", "compact").lower()
-        self.report_max_open = int(os.getenv("REPORT_MAX_OPEN", "3"))
-
-        self.app = web.Application(middlewares=[self._auth_mw])
-        self.app.add_routes([
-            web.get("/bots", self.get_bots),
-            web.post("/bots", self.post_bot),
-            web.delete("/bots/{name}", self.del_bot),
-            web.get("/funds", self.get_funds),
-        ])
-        self._runner: Optional[web.AppRunner] = None
-        self._site: Optional[web.TCPSite] = None
-        self._report_task: Optional[asyncio.Task] = None
-
-    @web.middleware
-    async def _auth_mw(self, request, handler):
-        if self.token and request.headers.get("x-admin-token") != self.token:
-            return web.json_response({"error":"unauthorized"}, status=401)
-        return await handler(request)
-
-    async def get_bots(self, request):
-        return web.json_response({"bots": self.mgr.list_names()})
-
-    async def get_funds(self, request):
-        bal = await self.funds.balances()
-        return web.json_response({k: str(v) for k, v in bal.items()})
-
-    async def post_bot(self, request):
-        payload = await request.json()
-        sym = str(payload.get("symbol","")).upper()
-        if not sym:
-            return web.json_response({"error":"symbol required"}, status=400)
-        venue = str(payload.get("venue","us")).lower()
-        use_us = (venue == "us")
-
-        buy_gap = Decimal(str(payload.get("buy_gap_pct", 0.2)))
-        sell_gap = Decimal(str(payload.get("sell_gap_pct", 0.2)))
-        min_profit = Decimal(str(payload.get("min_profit_pct", payload.get("sell_gap_pct", 0.2))))
-        order_expiry_seconds = int(payload.get("order_expiry_seconds", payload.get("order_ttl_seconds", 0)))
-        fee = Decimal(str(payload.get("fee_rate", 0.0001)))
-        starting_base_qty = Decimal(str(payload.get("starting_base_qty", payload.get("base", 0))))
-        starting_quote_qty = Decimal(str(payload.get("starting_quote_qty", payload.get("quote", 2000))))
-        bot_lifetime_seconds = int(payload.get("bot_lifetime_seconds", payload.get("expiry_sec", 0)))
-        respawn_delay_seconds = int(payload.get("respawn_delay_seconds", payload.get("respawn_after_sec", 0)))
-
-        # momentum
-        momentum_enabled = bool(payload.get("momentum_enabled", True))
-        momentum_breakout_pct = Decimal(str(payload.get("momentum_breakout_pct", 1.0)))
-        momentum_seed_quote = Decimal(str(payload.get("momentum_seed_quote", 50)))
-        momentum_max_seeds = int(payload.get("momentum_max_seeds", 1))
-
-        # BUY tranche
-        buy_tranche_quote = Decimal(str(payload.get("buy_tranche_quote", 0)))
-        buy_tranche_pct   = Decimal(str(payload.get("buy_tranche_pct", 0.25)))
-
-        filters = payload.get("filters", self.filters_default)
-
-        # ensure WS feeder
-        ws_name = f"ws-{sym.lower()}"
-        if ws_name not in self.mgr._supers:
-            ws_cfg = BotConfig(
-                name=ws_name, tick_seconds=0.1,
-                params={"bus": self.bus, "use_us": use_us, "symbols": [sym]},
-            )
-            await self.mgr.add_and_start(ws_name, lambda c: WSPriceBot(c), ws_cfg)
-
-        paper_name = f"paper-{sym.lower()}"
-        if paper_name in self.mgr._supers:
-            return web.json_response({"error":f"bot {paper_name} exists"}, status=409)
-
-        paper_cfg = BotConfig(
-            name=paper_name, tick_seconds=1.0,
-            params={
-                "bus": self.bus,
-                "fund_mgr": self.funds,
-                "hub": self.hub,
-                "symbol": sym,
-                "filters": filters,
-                "gaps": {"buy_gap_pct": float(buy_gap), "sell_gap_pct": float(sell_gap)},
-                "min_profit_pct": float(min_profit),
-                "balances": {"base": str(starting_base_qty), "quote": str(starting_quote_qty)},
-                "fee_rate": float(fee),
-                "order_expiry_seconds": order_expiry_seconds,
-                "bot_lifetime_seconds": bot_lifetime_seconds,
-                # momentum
-                "momentum_enabled": momentum_enabled,
-                "momentum_breakout_pct": float(momentum_breakout_pct),
-                "momentum_seed_quote": str(momentum_seed_quote),
-                "momentum_max_seeds": momentum_max_seeds,
-                # buy tranche
-                "buy_tranche_quote": str(buy_tranche_quote),
-                "buy_tranche_pct": float(buy_tranche_pct),
-            },
-        )
-        await self.mgr.add_and_start(paper_name, lambda c: PaperTradingBot(c), paper_cfg)
-        self.log.info("added %s (+ %s if new) (EST %s)", paper_name, ws_name, ts_est())
-
-        if respawn_delay_seconds:
-            self.mgr._meta[paper_name][1].params["respawn_delay_seconds"] = respawn_delay_seconds
-
-        return web.json_response({"ok": True, "added": [paper_name], "ws": ws_name})
-
-    async def del_bot(self, request):
-        name = request.match_info["name"]
-        meta = self.mgr.get_meta(name)
-        ok = await self.mgr.remove_and_stop(name)
-        if not ok:
-            return web.json_response({"removed": False, "name": name}, status=404)
-        qs = request.rel_url.query
-        respawn_after = int(qs.get("respawn_after", "0")) or 0
-        if respawn_after and meta:
-            factory, old_cfg = meta
-            new_cfg = BotConfig(
-                name=old_cfg.name, tick_seconds=old_cfg.tick_seconds,
-                max_backoff=old_cfg.max_backoff, jitter=old_cfg.jitter,
-                params=dict(old_cfg.params),
-            )
-            async def _respawn():
-                await asyncio.sleep(respawn_after)
-                await self.mgr.add_and_start(new_cfg.name, factory, new_cfg)
-                self.log.info("respawned %s after %ss (EST %s)", new_cfg.name, respawn_after, ts_est())
-            asyncio.create_task(_respawn())
-        return web.json_response({"removed": True, "name": name, "respawn_scheduled": bool(respawn_after)})
-
-    def _render_compact(self, pools: Dict[str, Decimal], snaps: Dict[str, Dict[str, Any]]) -> str:
-        lines = [f"=== Global Report @ {ts_est()} ==="]
-        if pools:
-            pool_line = " | ".join(f"{a} {pools[a]}" for a in sorted(pools.keys()))
-            lines.append(f"Available Fund: {pool_line}")
-        else:
-            lines.append("Available Fund: (none)")
-        for name, s in sorted(snaps.items()):
-            sym = s.get("symbol","")
-            last = s.get("price","n/a")
-            stage = s.get("stage",0)
-            active = s.get("active","0h 0m 0s")
-            pnl = s.get("pnl","n/a")
-            pnl_pct = s.get("pnl_pct","n/a")
-            qsym = s.get("quote_sym",""); bsym = s.get("base_sym","")
-            qbal = s.get("quote_bal","0"); bbal = s.get("base_bal","0")
-            lines.append(f"\n{name} | Stage {stage} | Active {active} | Last={last}")
-            trail = s.get("price_trail")
-            if trail:
-                lines.append(f"Price(≤{os.getenv('REPORT_TICK_HISTORY','5')}): {trail}")
-            lines.append(f"Funds: {qsym} {qbal} | {bsym} {bbal}")
-            lines.append(f"PnL: {pnl} ( {pnl_pct} )")
-            osum = s.get("open_summary",{})
-            lines.append(f"Open: BUY {osum.get('buy_count',0)} (qty {osum.get('buy_qty_sum','0')}; M:{osum.get('buy_momentum_count',0)}), "
-                         f"SELL {osum.get('sell_count',0)} (qty {osum.get('sell_qty_sum','0')})")
-            bf = s.get("last_fills",{}).get("buy",(None,None,False))
-            sf = s.get("last_fills",{}).get("sell",(None,None))
-            buy_tag = "[M]" if (bf[2] if len(bf)>2 else False) else ""
-            lines.append(f"Last fills: BUY{buy_tag} @ {bf[0] or 'n/a'} ({bf[1]}), SELL @ {sf[0] or 'n/a'} ({sf[1]})")
-            ods = s.get("open_display",[])
-            if ods:
-                lines.append("Open orders:")
-                for od in ods:
-                    lines.append(f"  {od}")
         return "\n".join(lines)
 
-    async def _global_reporter(self):
-        log = logging.getLogger("report")
-        bar = "=" * 80
-        while True:
-            try:
-                await asyncio.sleep(self.report_every)
-                pools = await self.funds.balances()
-                snaps = await self.hub.all()
-                if self.report_mode == "compact":
-                    text = self._render_compact(pools, snaps)
-                else:
-                    text = json.dumps({"pools": {k:str(v) for k,v in pools.items()},
-                                       "snaps": snaps}, indent=2)
-                log.info("\n%s\n%s\n%s\n", bar, text, bar)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.getLogger("report").warning("reporter error: %s", e)
+# --------------------------- Manager / API ---------------------------
 
-    async def start(self, host="127.0.0.1", port=8080):
-        self._runner = web.AppRunner(self.app)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, host=host, port=port)
-        await self._site.start()
-        self._report_task = asyncio.create_task(self._global_reporter())
-        self.log.info("admin API listening on http://%s:%s (EST %s)", host, port, ts_est())
+class Manager:
+    def __init__(self):
+        self.fund = FundManager(SEED_QUOTE, SEED_AMOUNT)
+        self.price_feed = PriceFeed()
+        self.bots: Dict[str, Bot] = {}
+        self._report_task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        if REPORT_MODE == "compact":
+            self._report_task = asyncio.create_task(self._report_loop())
 
     async def stop(self):
         if self._report_task:
             self._report_task.cancel()
-            try:
-                await self._report_task
-            except asyncio.CancelledError:
-                pass
-        if self._site:
-            await self._site.stop()
-        if self._runner:
-            await self._runner.cleanup()
+            with contextlib.suppress(Exception): await self._report_task
+        for b in list(self.bots.values()):
+            with contextlib.suppress(Exception): await b.stop()
+        await self.price_feed.stop()
 
-# --------------------------- CLI & bootstrap ---------------------
-def parse_args():
-    ap = argparse.ArgumentParser(description="Paper bots with admin API + fund manager + compact global report (price trails, last-price fills, fee-aware sizing, tranche buys)")
-    ap.add_argument("--admin-host", default=os.getenv("ADMIN_HOST","127.0.0.1"))
-    ap.add_argument("--admin-port", type=int, default=int(os.getenv("ADMIN_PORT","8080")))
-    ap.add_argument("--venue", choices=["us","com"], default="us", help="Binance venue")
-    ap.add_argument("--paper", action="append", default=[], help="Start these symbols at boot (repeatable)")
-    ap.add_argument("--seed-quote", default=os.getenv("SEED_QUOTE","USD"))
-    ap.add_argument("--seed-amount", type=float, default=float(os.getenv("SEED_AMOUNT","20000")))
-    return ap.parse_args()
+    async def _report_loop(self):
+        while True:
+            await asyncio.sleep(REPORT_EVERY)
+            print(self.render_report())
 
-async def main() -> None:
-    setup_logging()
-    args = parse_args()
+    def render_report(self) -> str:
+        parts = []
+        parts.append("=" * 60)
+        parts.append(f"{now_est_str()}  |  POOL SUMMARY")
+        funds = self.fund.funds_summary()
+        allocated = sum(v["quote"] for v in funds["bots"].values())
+        parts.append(f"Pool Funds: {fmt_money(funds['pool_quote'])}   (seed {fmt_money(SEED_AMOUNT)} → allocated to bots: {fmt_money(allocated)})")
+        parts.append(f"Active Bots: {len(self.bots)}  ({', '.join(self.bots.keys())})")
+        for name, bot in self.bots.items():
+            parts.append("")
+            parts.append(bot.render_compact())
+        return "\n".join(parts)
 
-    bus = PriceBus()
-    funds = FundManager()
-    hub = ReportHub()
-    funds.seed(args.seed_quote, d(args.seed_amount))
+    async def handle_get_funds(self, request: web.Request):
+        return web.json_response(self.fund.funds_summary())
 
-    mgr = BotManager()
+    async def handle_get_bots(self, request: web.Request):
+        out = []
+        for name, bot in self.bots.items():
+            ss = bot.snapshot()
+            out.append({
+                "name": name,
+                "symbol": bot.symbol,
+                "venue": bot.venue,
+                "quote": bot.quote,
+                "core_base": bot.core.base_avail,
+                "momo_base": bot.momo.base_avail,
+                "pnl_abs": ss["pnl_abs"],
+                "pnl_pct": ss["pnl_pct"],
+                "core_stage": ss["core_stage"],
+                "momo_stage": ss["momo_stage"],
+            })
+        return web.json_response(out)
 
-    # Optional boot bots
-    for sym in [s.upper() for s in args.paper]:
-        ws = BotConfig(
-            name=f"ws-{sym.lower()}",
-            tick_seconds=0.1,
-            params={"bus": bus, "use_us": (args.venue=='us'), "symbols":[sym]},
-        )
-        paper = BotConfig(
-            name=f"paper-{sym.lower()}",
-            tick_seconds=1.0,
-            params={
-                "bus": bus,
-                "fund_mgr": funds,
-                "hub": hub,
-                "symbol": sym,
-                "filters": {"tick":"0.01","step":"0.000001","min_qty":"0.00001","min_notional":"10.0"},
-                "gaps": {"buy_gap_pct": 0.2, "sell_gap_pct": 0.2},
-                "min_profit_pct": 0.1,
-                "balances": {"base":"0", "quote":"2000"},
-                "fee_rate": 0.0001,
-                "order_expiry_seconds": 0,
-                "bot_lifetime_seconds": 0,
-                "momentum_enabled": True,
-                "momentum_breakout_pct": 1.0,
-                "momentum_seed_quote": "50",
-                "momentum_max_seeds": 1,
-                "buy_tranche_quote": "0",
-                "buy_tranche_pct": 0.25,
-            },
-        )
-        await mgr.add_and_start(ws.name, lambda c: WSPriceBot(c), ws)
-        await mgr.add_and_start(paper.name, lambda c: PaperTradingBot(c), paper)
+    async def handle_post_bots(self, request: web.Request):
+        data = await request.json()
+        symbol = data.get("symbol", "").upper()
+        venue = data.get("venue", "us")
+        if not symbol:
+            return web.json_response({"error": "symbol required"}, status=400)
 
-    admin = AdminHTTP(mgr, bus, funds, hub)
-    await admin.start(host=args.admin_host, port=args.admin_port)
+        params = {
+            "buy_gap_pct": float(data.get("buy_gap_pct", 0.4)),
+            "sell_gap_pct": float(data.get("sell_gap_pct", 0.5)),
+            "min_profit_pct": float(data.get("min_profit_pct", 0.25)),
+            "order_expiry_seconds": int(data.get("order_expiry_seconds", 0)),
+            "fee_rate": float(data.get("fee_rate", 0.001)),
+            "starting_base_qty": float(data.get("starting_base_qty", 0.0)),
+            "starting_quote_qty": float(data.get("starting_quote_qty", 0.0)),
+            "buy_tranche_quote": float(data.get("buy_tranche_quote", 0.0)),
+            "buy_tranche_pct": float(data.get("buy_tranche_pct", 0.5)),
+            "momentum_enabled": bool(data.get("momentum_enabled", True)),
+            "momentum_breakout_pct": float(data.get("momentum_breakout_pct", 0.5)),
+            "bot_lifetime_seconds": int(data.get("bot_lifetime_seconds", 0)),
+            "price_tick": float(data.get("price_tick", 0.01)),
+            "qty_tick": float(data.get("qty_tick", 1e-6)),
+        }
 
-    try:
-        await mgr.run()
-    finally:
-        await admin.stop()
+        bot_name = f"{symbol}-{str(uuid.uuid4())[:8]}"
+        try:
+            self.fund.allocate(bot_name, params["starting_quote_qty"], params["starting_base_qty"])
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+        bot = Bot(self, bot_name, symbol, venue, params, self.price_feed)
+        self.bots[bot_name] = bot
+        bot.start()
+        return web.json_response({"name": bot_name, "symbol": symbol, "venue": venue, "params": params})
+
+    async def handle_delete_bot(self, request: web.Request):
+        name = request.match_info.get("name")
+        if name not in self.bots:
+            return web.json_response({"error": "not found"}, status=404)
+
+        respawn_after = request.rel_url.query.get("respawn_after")
+        params = self.bots[name].params if respawn_after else None
+        symbol = self.bots[name].symbol if respawn_after else None
+        venue  = self.bots[name].venue if respawn_after else None
+
+        await self.bots[name].stop()
+        del self.bots[name]
+
+        if respawn_after:
+            try: delay = int(respawn_after)
+            except: delay = 0
+            asyncio.create_task(self._respawn_later(symbol, venue, params, delay))
+            return web.json_response({"status": "deleted", "respawn_scheduled_in_seconds": delay})
+        else:
+            return web.json_response({"status": "deleted"})
+
+    async def _respawn_later(self, symbol: str, venue: str, params: Dict[str, Any], delay: int):
+        await asyncio.sleep(max(0, delay))
+        bot_name = f"{symbol}-{str(uuid.uuid4())[:8]}"
+        try:
+            self.fund.allocate(bot_name, params["starting_quote_qty"], params["starting_base_qty"])
+        except Exception as e:
+            logging.error("Respawn allocation failed: %s", e)
+            return
+        bot = Bot(self, bot_name, symbol, venue, params, self.price_feed)
+        self.bots[bot_name] = bot
+        bot.start()
+
+# --------------------------- Server ---------------------------
+
+async def init_app(manager: Manager) -> web.Application:
+    app = web.Application()
+    app["manager"] = manager
+    app.add_routes([
+        web.get("/funds", lambda req: manager.handle_get_funds(req)),
+        web.get("/bots", lambda req: manager.handle_get_bots(req)),
+        web.post("/bots", lambda req: manager.handle_post_bots(req)),
+        web.delete("/bots/{name}", lambda req: manager.handle_delete_bot(req)),
+    ])
+    return app
+
+async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    manager = Manager()
+    await manager.start()
+    app = await init_app(manager)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, ADMIN_HOST, ADMIN_PORT)
+    await site.start()
+    logging.info("Admin API listening on http://%s:%s", ADMIN_HOST, ADMIN_PORT)
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _signal():
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, _signal)
+
+    await stop_event.wait()
+    logging.info("Shutting down...")
+    await manager.stop()
+    await runner.cleanup()
 
 if __name__ == "__main__":
     try:
