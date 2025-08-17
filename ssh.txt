@@ -30,6 +30,8 @@ docker stop btc-bot
 docker rm -f btc-bot
 
 # move new python file
+scp /path/to/bot_manager.py jhfadm_gmail_com@binace-bot:~/bot/
+
 cd bot
 rm bot_manager.py
 mv ~/bot_manager.py ~/bot/
